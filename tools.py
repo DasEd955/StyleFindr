@@ -12,6 +12,7 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
+import json
 import os
 import re
 
@@ -21,6 +22,9 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+# Free-tier model shared across the LLM-backed tools.
+_MODEL = "llama-3.3-70b-versatile"
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -33,6 +37,20 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat(messages: list[dict], temperature: float, json_mode: bool = False) -> str:
+    """
+    Thin wrapper around a Groq chat completion. Raises on API/network failure so
+    the agent layer can catch it and report the error (per the Error Handling
+    table in planning.md) — it does not swallow exceptions.
+    """
+    client = _get_groq_client()
+    kwargs = {"model": _MODEL, "messages": messages, "temperature": temperature}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
 
 
 # ── Tool 1 helpers ──────────────────────────────────────────────────────────
@@ -172,35 +190,134 @@ def search_listings(
     return [item for _, item in scored]
 
 
+# ── Tool 2 helpers ────────────────────────────────────────────────────────────
+
+def _format_item(item: dict) -> str:
+    """One-line summary of a listing for the LLM prompt."""
+    tags = ", ".join(item.get("style_tags", []))
+    colors = ", ".join(item.get("colors", []))
+    return (
+        f"{item.get('title', 'Unknown item')} "
+        f"(category: {item.get('category', 'n/a')}; "
+        f"colors: {colors or 'n/a'}; style: {tags or 'n/a'})"
+    )
+
+
+def _format_wardrobe(wardrobe: dict) -> str:
+    """Bullet list of wardrobe pieces, grouped enough for the LLM to reason over."""
+    lines = []
+    for w in wardrobe.get("items", []):
+        tags = ", ".join(w.get("style_tags", []))
+        colors = ", ".join(w.get("colors", []))
+        note = f" — {w['notes']}" if w.get("notes") else ""
+        lines.append(
+            f"- {w.get('name', 'Unnamed')} [{w.get('category', 'n/a')}; "
+            f"{colors}; {tags}]{note}"
+        )
+    return "\n".join(lines)
+
+
+def _normalize_outfit(parsed: dict) -> dict:
+    """Guarantee all four contract fields exist with the right types."""
+    matching = parsed.get("matching_items", [])
+    if isinstance(matching, str):
+        matching = [matching]
+    return {
+        "outfit_description": str(parsed.get("outfit_description", "")).strip(),
+        "matching_items": [str(m) for m in matching] if isinstance(matching, list) else [],
+        "style_reasoning": str(parsed.get("style_reasoning", "")).strip(),
+        "style_category": str(parsed.get("style_category", "")).strip(),
+    }
+
+
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
 
-def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
+def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
     """
-    Given a thrifted item and the user's wardrobe, suggest 1–2 complete outfits.
+    Given a thrifted item and the user's wardrobe, suggest a complete outfit.
 
     Args:
         new_item: A listing dict (the item the user is considering buying).
         wardrobe: A wardrobe dict with an 'items' key containing a list of
-                  wardrobe item dicts. May be empty — handle this gracefully.
+                  wardrobe item dicts. May be empty — handled gracefully via a
+                  generic-staples fallback.
 
     Returns:
-        A non-empty string with outfit suggestions.
-        If the wardrobe is empty, offer general styling advice for the item
-        rather than raising an exception or returning an empty string.
+        A dict (per planning.md Tool 2 spec) with:
+            outfit_description (str): the recommended outfit in plain language
+            matching_items (list[str]): named wardrobe pieces used (or, when the
+                wardrobe is empty, the generic staples suggested)
+            style_reasoning (str): why the combination works
+            style_category (str): aesthetic label (e.g. "streetwear")
 
-    TODO:
-        1. Check whether wardrobe['items'] is empty.
-        2. If empty: call the LLM with a prompt for general styling ideas
-           (what kinds of items pair well, what vibe it suits, etc.).
-        3. If not empty: format the wardrobe items into a prompt and ask
-           the LLM to suggest specific outfit combinations using the new item
-           and named pieces from the wardrobe.
-        4. Return the LLM's response as a string.
-
-    Before writing code, fill in the Tool 2 section of planning.md.
+    Failure modes:
+        - Empty wardrobe → LLM is asked for generic staples; matching_items
+          holds those staples and outfit_description flags they are suggestions,
+          not owned pieces. This is NOT an error; the loop continues.
+        - LLM/API failure → the underlying exception propagates so the agent can
+          catch it, set error_message, and stop (it never returns None silently).
+        - Malformed JSON from the LLM → falls back to wrapping the raw text in a
+          well-formed dict rather than crashing.
     """
-    # Replace this with your implementation
-    return ""
+    items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+    item_summary = _format_item(new_item)
+
+    if not items:
+        # Empty-wardrobe fallback: recommend generic staples to build around.
+        user_prompt = (
+            f"A shopper is considering this secondhand item:\n{item_summary}\n\n"
+            "They have NOT entered any wardrobe yet, so you cannot reference items "
+            "they own. Suggest one complete outfit built around this piece using "
+            "generic staple items (e.g. straight-leg jeans, white sneakers). Make "
+            "clear in the description that these are general suggestions, not items "
+            "they already own.\n\n"
+            "Respond with ONLY a JSON object with these keys:\n"
+            '  "outfit_description" (string),\n'
+            '  "matching_items" (array of the generic staple names you suggested),\n'
+            '  "style_reasoning" (string, 1-2 sentences),\n'
+            '  "style_category" (string, e.g. "streetwear", "cottagecore").'
+        )
+    else:
+        user_prompt = (
+            f"A shopper is considering this secondhand item:\n{item_summary}\n\n"
+            f"Here is their current wardrobe:\n{_format_wardrobe(wardrobe)}\n\n"
+            "Suggest ONE complete, wearable outfit that pairs the new item with "
+            "specific pieces they already own. Reference the wardrobe pieces by "
+            "their exact names.\n\n"
+            "Respond with ONLY a JSON object with these keys:\n"
+            '  "outfit_description" (string referencing the new item and the '
+            'wardrobe pieces by name),\n'
+            '  "matching_items" (array of the exact wardrobe item names you used),\n'
+            '  "style_reasoning" (string, 1-2 sentences on why it works),\n'
+            '  "style_category" (string, e.g. "streetwear", "quiet luxury").'
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are FitFindr, a sharp, practical personal stylist for "
+                "secondhand fashion. You always reply with valid JSON only."
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+
+    content = _chat(messages, temperature=0.7, json_mode=True)
+
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        # Defensive: model returned non-JSON despite json_mode. Wrap it so the
+        # caller still receives the contract shape instead of a crash.
+        return {
+            "outfit_description": (content or "").strip(),
+            "matching_items": [],
+            "style_reasoning": "",
+            "style_category": "",
+        }
+
+    return _normalize_outfit(parsed)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
