@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,6 +33,76 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+# ── Tool 1 helpers ──────────────────────────────────────────────────────────
+
+# Common words that carry no search signal — dropped from query keywords so they
+# don't inflate relevance scores (e.g. "a vintage tee for me" → ["vintage", "tee"]).
+_STOPWORDS = {
+    "a", "an", "the", "for", "with", "in", "of", "and", "or", "to",
+    "my", "i", "me", "some", "looking", "want", "need", "size",
+}
+
+
+def _extract_keywords(description: str) -> list[str]:
+    """Lower-case, strip punctuation, and drop stopwords/short tokens."""
+    if not description:
+        return []
+    tokens = re.split(r"[^a-z0-9]+", description.lower())
+    return [t for t in tokens if len(t) >= 2 and t not in _STOPWORDS]
+
+
+def _size_matches(requested: str, listing_size: str) -> bool:
+    """
+    True if a listing's size satisfies the requested size.
+
+    Sizes in the dataset are inconsistent ("S/M", "XL (oversized)", "M/L",
+    "One Size / Oversized", "W30 L30", "US 7"). We tokenize the listing size
+    and check for an exact token match so "M" matches "S/M" and "M/L" but NOT
+    "XL" (which a naive substring check would wrongly catch). "One Size" items
+    fit anyone, so they match any requested size.
+    """
+    if not requested:
+        return True
+    req = requested.strip().upper()
+    listing = (listing_size or "").upper()
+
+    # Universal-fit items satisfy every request.
+    if "ONE SIZE" in listing:
+        return True
+
+    tokens = [t for t in re.split(r"[^A-Z0-9]+", listing) if t]
+    return req in tokens
+
+
+def _relevance_score(listing: dict, keywords: list[str]) -> int:
+    """
+    Weighted keyword-overlap score. Style tags are the strongest signal,
+    then title/colors/category/brand, then the free-text description.
+    """
+    title = listing.get("title", "").lower()
+    desc = listing.get("description", "").lower()
+    category = listing.get("category", "").lower()
+    brand = (listing.get("brand") or "").lower()
+    tag_text = " ".join(listing.get("style_tags", [])).lower()
+    color_text = " ".join(listing.get("colors", [])).lower()
+
+    score = 0
+    for kw in keywords:
+        if kw in tag_text:
+            score += 3
+        if kw in title:
+            score += 2
+        if kw in color_text:
+            score += 2
+        if kw == category:
+            score += 2
+        if brand and kw in brand:
+            score += 2
+        if kw in desc:
+            score += 1
+    return score
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +140,36 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    # 1. Load the full dataset. A failure here (missing/corrupt data file) is a
+    #    genuinely unexpected error — we let it propagate so the agent layer can
+    #    report "search failed", distinct from the normal "no matches" case.
+    listings = load_listings()
+
+    # 2. Hard filters: price ceiling (inclusive) and size, when provided.
+    filtered = []
+    for item in listings:
+        if max_price is not None and item.get("price", float("inf")) > max_price:
+            continue
+        if size and not _size_matches(size, item.get("size", "")):
+            continue
+        filtered.append(item)
+
+    # 3/4. Score by keyword relevance and drop listings with no overlap.
+    keywords = _extract_keywords(description)
+    if not keywords:
+        # No usable keywords (e.g. blank description): fall back to a
+        # price/size-only search, cheapest first.
+        return sorted(filtered, key=lambda x: x.get("price", 0.0))
+
+    scored = []
+    for item in filtered:
+        score = _relevance_score(item, keywords)
+        if score > 0:
+            scored.append((score, item))
+
+    # 5. Sort by relevance (desc), tie-break by price (asc). Return dicts only.
+    scored.sort(key=lambda pair: (-pair[0], pair[1].get("price", 0.0)))
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
