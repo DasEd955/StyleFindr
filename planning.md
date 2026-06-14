@@ -231,6 +231,15 @@ flowchart TD
 
 **Milestone 4 — Planning loop and state management:**
 
+- GitHub Copilot & Claude Code will be provided with the given planning loop description, architecture diagram via Mermaid, and state management specification. The anticipated code output will encompass functionality that dynamically manages session state, executes tools conditionally based upon output, and handles errors gracefully (without silent failure). 
+
+- The implementation shall be verified by running:
+1. A successful test run of the end-to-end agentic workflow utilizing all 3 tools. 
+2. A search failure scenario (edge case).
+3. An empty wardrobe scenario (edge case). 
+4. An incomplete outfit scenario (edge case).  
+- Note: Implementation will only be considered complete when all edge cases (potential error paths) behave exactly as specified in this given document, `planning.md`. 
+
 ---
 
 ## A Complete Interaction (Step by Step)
@@ -243,6 +252,7 @@ StyleFindr is an agentic AI toolset that helps users find secondhand clothing re
 
 **Step 1:**
 <!-- What does the agent do first? Which tool is called? With what input? -->
+
 
 **Step 2:**
 <!-- What happens next? What was returned from step 1? What tool is called now? -->
