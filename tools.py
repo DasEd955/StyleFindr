@@ -320,34 +320,109 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
     return _normalize_outfit(parsed)
 
 
+# ── Tool 3 helpers ────────────────────────────────────────────────────────────
+
+def _normalize_fit_card(parsed: dict) -> dict:
+    """Guarantee the fit-card contract fields exist with the right types."""
+    tags = parsed.get("style_tags", [])
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, list):
+        tags = []
+    return {
+        "fit_card_text": str(parsed.get("fit_card_text", "")).strip(),
+        "style_tags": [str(t).strip() for t in tags][:4],
+        "caption_tone": str(parsed.get("caption_tone", "")).strip(),
+    }
+
+
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
 
-def create_fit_card(outfit: str, new_item: dict) -> str:
+def create_fit_card(outfit: dict, new_item: dict) -> dict:
     """
     Generate a short, shareable outfit caption for the thrifted find.
 
     Args:
-        outfit:   The outfit suggestion string from suggest_outfit().
-        new_item: The listing dict for the thrifted item.
+        outfit:   The outfit dict from suggest_outfit() — uses outfit_description
+                  and style_category. May be None/empty or missing
+                  outfit_description; handled via a simplified caption fallback.
+        new_item: The listing dict for the thrifted item (title, price, platform).
 
     Returns:
-        A 2–4 sentence string usable as an Instagram/TikTok caption.
-        If outfit is empty or missing, return a descriptive error message
-        string — do NOT raise an exception.
+        A dict (per planning.md Tool 3 spec) with:
+            fit_card_text (str): casual 1-3 sentence caption (may have one emoji)
+            style_tags (list[str]): 2-4 hashtag-style aesthetic keywords
+            caption_tone (str): detected tone (e.g. "casual", "confident")
 
-    The caption should:
-    - Feel casual and authentic (like a real OOTD post, not a product description)
-    - Mention the item name, price, and platform naturally (once each)
-    - Capture the outfit vibe in specific terms
-    - Sound different each time for different inputs (use higher LLM temperature)
+    Failure modes:
+        - outfit missing/empty outfit_description → build a simplified caption
+          from new_item fields only (does NOT crash, does NOT raise).
+        - LLM/API failure → the exception propagates so the agent can skip the
+          fit card and still display the outfit (partial success).
+        - Malformed JSON → wrap the raw text as the caption rather than crashing.
 
-    TODO:
-        1. Guard against an empty or whitespace-only outfit string.
-        2. Build a prompt that gives the LLM the item details and the outfit,
-           and asks for a caption matching the style guidelines above.
-        3. Call the LLM and return the response.
-
-    Before writing code, fill in the Tool 3 section of planning.md.
+    Different inputs (and even repeat calls) produce different captions: the LLM
+    runs at high temperature and no fixed seed.
     """
-    # Replace this with your implementation
-    return ""
+    title = new_item.get("title", "this piece")
+    price = new_item.get("price")
+    platform = new_item.get("platform", "secondhand")
+    price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
+
+    outfit = outfit if isinstance(outfit, dict) else {}
+    description = (outfit.get("outfit_description") or "").strip()
+    style_category = (outfit.get("style_category") or "").strip()
+
+    if not description:
+        # Fallback: no outfit context — caption the find from the item alone.
+        user_prompt = (
+            f"Write a short, authentic social-media caption for a secondhand "
+            f"find. Item: {title}, bought for {price_str} on {platform}. There "
+            f"is no styling context, so focus on the excitement of the find "
+            f"itself.\n\n"
+        )
+    else:
+        category_line = f"Overall vibe: {style_category}.\n" if style_category else ""
+        user_prompt = (
+            f"Write a short, authentic social-media caption for a secondhand "
+            f"find styled into an outfit.\n"
+            f"Item: {title}, bought for {price_str} on {platform}.\n"
+            f"Outfit: {description}\n"
+            f"{category_line}\n"
+        )
+
+    user_prompt += (
+        "Style rules: sound like a real person posting an OOTD, NOT a product "
+        "description. 1-3 sentences. Mention the item name, price, and platform "
+        "naturally (once each). At most one emoji.\n\n"
+        "Respond with ONLY a JSON object with these keys:\n"
+        '  "fit_card_text" (string, the caption),\n'
+        '  "style_tags" (array of 2-4 short hashtag-style aesthetic keywords, '
+        "no # symbol),\n"
+        '  "caption_tone" (string, e.g. "casual", "confident", "nostalgic").'
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are FitFindr's caption writer. You write punchy, authentic "
+                "thrift-haul captions and always reply with valid JSON only."
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # High temperature so repeat calls on the same input still vary.
+    content = _chat(messages, temperature=1.0, json_mode=True)
+
+    try:
+        parsed = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return {
+            "fit_card_text": (content or "").strip(),
+            "style_tags": [],
+            "caption_tone": "",
+        }
+
+    return _normalize_fit_card(parsed)
