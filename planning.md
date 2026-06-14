@@ -139,6 +139,8 @@ The agent maintains a session state dictionary throughout the interaction. This 
 - `fit_card`
 - `error_message`
 
+After `search_listings` is executed, the selected listing is saved as `selected_item`. This value is then directly passed into `suggest_outfit`. Afterwards, the generated outfit is saved as `selected_outfit` & passed as an input parameter into `create_fit_card`. This procedure helps prevent the user from needing to repeat information (time & space complexity optimization) and ensures that each subsequent tool carries the outputs of the previous tools. 
+
 ---
 
 ## Error Handling
@@ -147,9 +149,9 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | |
-| suggest_outfit | Wardrobe is empty | |
-| create_fit_card | Outfit input is missing or incomplete | |
+| search_listings | No results match the query | Notify the user that no matches were found for the given search query. Suggest relaxing filters & stop the workflow. |
+| suggest_outfit | Wardrobe is empty | Generate styling recommendations using generic wardrobe staples & notify the user that personalized matching was unavailable |
+| create_fit_card | Outfit input is missing or incomplete | Generate a simplified caption from available existing item data or return the outfit recommendation without a fit card. |
 
 ---
 
