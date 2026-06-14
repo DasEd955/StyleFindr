@@ -155,7 +155,7 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 ---
 
-## Architecture (Note - Finalizd Architecture TBD)
+## Architecture (Note - Finalized Architecture TBD)
 
 <!-- Draw a diagram of your agent showing how the components connect:
      User input → Planning Loop → Tools (search_listings, suggest_outfit, create_fit_card)
@@ -224,6 +224,10 @@ flowchart TD
      before trusting it" is a plan. -->
 
 **Milestone 3 — Individual tool implementations:**
+- AI Tools: GitHub Copilot & Claude Code utilized to implement each tool separately via an interative, layer-by-layer approach. 
+- For `search_listings()`, the tool specification will be provided along with the listings schema/metadata & the data loader helper functions. The anticipated output produces will be code that filters & ranks JSON listings based on description, size, and price. At minimum 3 different queries will be tested, including an intentional edge case that returns no results. 
+- For `suggest_outfit()`, the wardrobe schema & tool specification will be provided as input. The expected output will be code that identifies complementary wardrobe pieces and/or accessories along with generation of outfit recommendations. Both shall be tested with getter functions, `get_empty_wardrobe()` & `get_example_wardrobe()`. 
+- For `create_fit_card()`, example outfit outputs & desired social media intonation will be provided. The anticipated output will be code that generates short, shareable captions. Multiple outfits will be tested to verify that captions vary dynamically based on given input. 
 
 **Milestone 4 — Planning loop and state management:**
 
