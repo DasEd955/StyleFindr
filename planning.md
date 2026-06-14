@@ -166,43 +166,43 @@ For each tool, describe the specific failure mode you're handling and what the a
      sketch are all fine. You'll share this diagram with an AI tool when asking it to implement
      the planning loop and each individual tool. -->
 
-flowchart TD
+flowchart TD;
 
-A[User Query] --> B[Planning Loop]
+A[User Query] --> B[Planning Loop];
 
-B --> C[search_listings]
+B --> C[search_listings];
 
-C --> D{Results Found?}
+C --> D{Results Found?};
 
-D -->|No| E[Display No Results Message]
-E --> F[End Session]
+D -->|No| E[Display No Results Message];
+E --> F[End Session];
 
-D -->|Yes| G[Store selected_item in State]
+D -->|Yes| G[Store selected_item in State];
 
-G --> H[suggest_outfit]
+G --> H[suggest_outfit];
 
-H --> I{Wardrobe Available?}
+H --> I{Wardrobe Available?};
 
-I -->|No| J[Generate Generic Outfit]
-I -->|Yes| K[Generate Personalized Outfit]
+I -->|No| J[Generate Generic Outfit];
+I -->|Yes| K[Generate Personalized Outfit];
 
-J --> L[Store selected_outfit]
-K --> L
+J --> L[Store selected_outfit];
+K --> L;
 
-L --> M[create_fit_card]
+L --> M[create_fit_card];
 
-M --> N{Fit Card Generated?}
+M --> N{Fit Card Generated?};
 
-N -->|No| O[Show Outfit Only]
-N -->|Yes| P[Show Outfit and Fit Card]
+N -->|No| O[Show Outfit Only];
+N -->|Yes| P[Show Outfit and Fit Card];
 
-O --> Q[End Session]
-P --> Q
+O --> Q[End Session];
+P --> Q;
 
-R[(Session State)]
-R <--> B
-R <--> G
-R <--> L
+R[(Session State)];
+R <--> B;
+R <--> G;
+R <--> L;
 
 ---
 
