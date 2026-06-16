@@ -12,7 +12,7 @@ raising. Private helpers (_tokens, _size_matches, _relevance_score, etc.) are
 module-internal and not part of the public API.
 
 Tools:
-    search_listings(description, size, max_price)  → list[dict]
+    search_listings(description, size, max_price)   → list[dict]
     suggest_outfit(new_item, wardrobe)              → dict
     create_fit_card(outfit, new_item)               → dict
 """
@@ -20,10 +20,8 @@ Tools:
 import json
 import os
 import re
-
 from dotenv import load_dotenv
 from groq import Groq
-
 from utils.data_loader import load_listings
 
 load_dotenv()
@@ -32,7 +30,7 @@ load_dotenv()
 _MODEL = "llama-3.3-70b-versatile"
 
 
-# ── Groq client ───────────────────────────────────────────────────────────────
+# ── Groq Client ───────────────────────────────────────────────────────────────
 
 def _get_groq_client():
     """
@@ -61,8 +59,8 @@ def _chat(messages: list[dict], temperature: float, json_mode: bool = False) -> 
     Send a chat completion request to Groq and return the response text.
 
     Thin wrapper that keeps the LLM call in one place so tests can monkeypatch
-    it without touching each tool. Raises on API or network failure — it does
-    not swallow exceptions — so the agent layer can catch and surface the error.
+    it without touching each tool. Raises on API or network failure (it does
+    not swallow exceptions) so the agent layer can catch and surface the error.
 
     Args:
         messages (list[dict]): OpenAI-format message dicts (role/content).
@@ -84,12 +82,12 @@ def _chat(messages: list[dict], temperature: float, json_mode: bool = False) -> 
     return response.choices[0].message.content
 
 
-# ── Tool 1 helpers ──────────────────────────────────────────────────────────
+# ── Tool 1 Helpers ──────────────────────────────────────────────────────────
 
-# Common words that carry no search signal — dropped from query keywords so they
+# Common words that carry no search signal: dropped from query keywords so they
 # don't inflate relevance scores (e.g. "a vintage tee for me" → ["vintage", "tee"]).
 # Includes conversational filler ("looking for a new pair under my budget, thanks!")
-# so polite, full-sentence queries don't leak noise words into the relevance score.
+# so polite, full sentence queries don't leak noise words into the relevance score.
 _STOPWORDS = {
     # articles, prepositions, conjunctions
     "a", "an", "the", "for", "with", "in", "of", "and", "or", "to", "on", "at",
@@ -107,10 +105,10 @@ _STOPWORDS = {
 
 def _tokens(text: str) -> set[str]:
     """
-    Tokenize a string into a set of lower-case word tokens for whole-word matching.
+    Tokenize a string into a set of lowercase word tokens for whole word matching.
 
     Splitting on non-alphanumeric boundaries and returning a set ensures that
-    keyword comparisons in _relevance_score() never match substrings — "we"
+    keyword comparisons in _relevance_score() never match substrings; e.g., "we"
     cannot match "western" because the tokens are compared with `in`, not `find`.
 
     Args:
@@ -151,7 +149,7 @@ _SIZE_WORDS = {
 }
 
 
-def _normalize_size_token(tok: str) -> str:
+def _normalize_size_token(token: str) -> str:
     """
     Map a word-form size to its canonical letter abbreviation.
 
@@ -160,12 +158,12 @@ def _normalize_size_token(tok: str) -> str:
     that are not in _SIZE_WORDS (e.g. "XL", "8") are returned unchanged.
 
     Args:
-        tok (str): An upper-case size token (e.g. "MEDIUM", "XL", "8.5").
+        token (str): An uppercase size token (e.g. "MEDIUM", "XL", "8.5").
 
     Returns:
-        str: The canonical form if recognized, otherwise tok unchanged.
+        str: The canonical form if recognized, otherwise token unchanged.
     """
-    return _SIZE_WORDS.get(tok, tok)
+    return _SIZE_WORDS.get(token, token)
 
 
 def _size_matches(requested: str, listing_size: str) -> bool:
@@ -174,10 +172,10 @@ def _size_matches(requested: str, listing_size: str) -> bool:
 
     The dataset uses two incompatible sizing systems: alpha apparel sizes
     ("S/M", "XL (oversized)", "M/L") and numeric shoe/waist sizes ("US 7",
-    "W30 L30"). A request only filters within its own system — asking for
+    "W30 L30"). A request only filters within its own system; e.g., asking for
     "Medium" (apparel) must NOT exclude shoes sized "US 8" because the two
     systems are not comparable. This cross-system pass-through prevents a
-    clothing-size request from silently wiping out the shoe category.
+    clothing size request from silently wiping out the shoe category.
 
     Args:
         requested (str): The size token from the parsed query (e.g. "M", "8").
@@ -194,7 +192,7 @@ def _size_matches(requested: str, listing_size: str) -> bool:
     req = _normalize_size_token(requested.strip().upper())
     listing = (listing_size or "").upper()
 
-    # Universal-fit items satisfy every request.
+    # Universal fit items satisfy every request.
     if "ONE SIZE" in listing:
         return True
 
@@ -209,21 +207,21 @@ def _size_matches(requested: str, listing_size: str) -> bool:
         # Apparel request: filter only against apparel listings.
         if listing_alpha:
             return req in listing_alpha
-        return True  # listing has no apparel size (e.g. shoes) — not comparable
+        return True  # Listing has no apparel size (e.g. shoes) → not comparable
     if re.fullmatch(r"\d+(?:\.\d+)?", req):
         # Numeric request: filter only against numeric listings.
         if listing_numbers:
             return float(req) in listing_numbers
-        return True  # listing has no numeric size — not comparable
+        return True  # Listing has no numeric size → not comparable
     # Unrecognized request format → don't exclude on size.
     return True
 
 
 def _relevance_score(listing: dict, keywords: list[str]) -> int:
     """
-    Compute a weighted keyword-overlap score for a single listing.
+    Compute a weighted keyword overlap score for a single listing.
 
-    Matching is whole-word (token-based via _tokens()), not substring, so
+    Matching is whole word (token-based via _tokens()), not substring, so
     conversational filler like "we" cannot score against "western" tags.
     Weights: style_tags (+3), title/colors/category/brand (+2 each), description (+1).
 
@@ -273,7 +271,7 @@ def search_listings(
     by keyword overlap using _relevance_score(). Listings with a score of zero are
     dropped. When no keywords can be extracted from the description (e.g. blank
     input), falls back to returning all price/size-filtered items sorted by price.
-    An empty result is a normal outcome — the function never raises on no matches.
+    An empty result is a normal outcome, the function never raises on no matches.
 
     Args:
         description (str): Keywords describing the item (e.g. "vintage graphic tee").
@@ -287,7 +285,7 @@ def search_listings(
             ascending as a tiebreaker. Empty list if nothing matches.
     """
     # 1. Load the full dataset. A failure here (missing/corrupt data file) is a
-    #    genuinely unexpected error — we let it propagate so the agent layer can
+    #    genuinely unexpected error; we let it propagate so the agent layer can
     #    report "search failed", distinct from the normal "no matches" case.
     listings = load_listings()
 
@@ -313,16 +311,16 @@ def search_listings(
         if score > 0:
             scored.append((score, item))
 
-    # 5. Sort by relevance (desc), tie-break by price (asc). Return dicts only.
+    # 5. Sort by relevance (desc), tie-break by price (ascending). Return dicts only.
     scored.sort(key=lambda pair: (-pair[0], pair[1].get("price", 0.0)))
     return [item for _, item in scored]
 
 
-# ── Tool 2 helpers ────────────────────────────────────────────────────────────
+# ── Tool 2 Helpers ────────────────────────────────────────────────────────────
 
 def _format_item(item: dict) -> str:
     """
-    Render a listing dict as a single-line summary for inclusion in an LLM prompt.
+    Render a listing dict as a single line summary for inclusion in an LLM prompt.
 
     Args:
         item (dict): A listing dict (title, category, colors, style_tags).
@@ -402,7 +400,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
     Args:
         new_item: A listing dict (the item the user is considering buying).
         wardrobe: A wardrobe dict with an 'items' key containing a list of
-                  wardrobe item dicts. May be empty — handled gracefully via a
+                  wardrobe item dicts. May be empty; handled gracefully via a
                   generic-staples fallback.
 
     Returns:
@@ -483,7 +481,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> dict:
     return _normalize_outfit(parsed)
 
 
-# ── Tool 3 helpers ────────────────────────────────────────────────────────────
+# ── Tool 3 Helpers ────────────────────────────────────────────────────────────
 
 def _normalize_fit_card(parsed: dict) -> dict:
     """

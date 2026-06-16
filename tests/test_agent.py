@@ -19,9 +19,7 @@ Run from the project root:
 """
 
 import json
-
 import pytest
-
 import agent
 import app
 import tools

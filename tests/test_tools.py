@@ -3,7 +3,7 @@ test_tools.py - Isolation tests for the three FitFindr tools.
 
 search_listings() is pure (no network) and is tested directly against the real
 dataset. suggest_outfit() and create_fit_card() call the Groq LLM, so tests
-monkeypatch tools._chat with a canned-JSON recorder — keeping the suite fast,
+monkeypatch tools._chat with a canned-JSON recorder. This keeps the suite fast,
 deterministic, and runnable without a GROQ_API_KEY.
 
 Coverage includes at least one test per documented failure mode: empty search
@@ -17,9 +17,7 @@ Run from the project root:
 """
 
 import json
-
 import pytest
-
 import tools
 from tools import create_fit_card, search_listings, suggest_outfit
 
@@ -49,7 +47,7 @@ EXAMPLE_WARDROBE = {
 EMPTY_WARDROBE = {"items": []}
 
 
-# ── search_listings (pure, no mocking) ──────────────────────────────────────
+# ── search_listings (Pure, No Mocking) ──────────────────────────────────────
 
 def test_search_returns_results():
     """Verify search_listings returns a non-empty list of dicts with title and price fields for a broad query."""
@@ -73,10 +71,10 @@ def test_search_price_filter():
 
 
 def test_search_size_filter():
-    """Verify apparel-size filtering only excludes alpha-sized items that don't include the requested size token.
+    """Verify apparel size filtering only excludes alpha-sized items that don't include the requested size token.
 
     Listings with numeric sizes (US 8, W29) or "One Size" are not comparable to
-    an apparel size and must pass through — relevance ranking decides those.
+    an apparel size and must pass through; relevance ranking decides those.
     """
     import re
 
@@ -88,7 +86,7 @@ def test_search_size_filter():
         alpha_tokens = tokens & _ALPHA
         if alpha_tokens:                      # apparel-sized → must include M
             assert "M" in alpha_tokens, f"{item['title']} ({size}) leaked into size M"
-        # else: numeric / One Size → not comparable, allowed through.
+        # Else: numeric / One Size → not comparable, allowed through.
 
 
 def test_search_whole_word_match_no_substring_leak():
@@ -107,7 +105,7 @@ def test_search_whole_word_match_no_substring_leak():
 
 
 def test_search_apparel_size_does_not_exclude_shoes():
-    """Regression: an apparel-size request must not exclude numeric-sized shoes since the two systems are not comparable."""
+    """Regression: an apparel-size request must not exclude numeric sized shoes since the two systems are not comparable."""
     boots = search_listings("boots", size="Medium", max_price=200)
     assert any("boots" in r["title"].lower() for r in boots), (
         "apparel-size request excluded numeric-sized shoes"
@@ -179,7 +177,7 @@ def test_suggest_outfit_malformed_json(monkeypatch):
     assert result["matching_items"] == []
 
 
-# ── create_fit_card (LLM mocked) ────────────────────────────────────────────
+# ── create_fit_card (LLM Mocked) ────────────────────────────────────────────
 
 def test_fit_card_returns_contract_dict(fake_llm):
     """Verify create_fit_card returns a dict with all three contract keys and 0–4 style tags."""

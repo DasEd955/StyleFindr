@@ -8,7 +8,7 @@ results terminate early with an error, while suggest_outfit failure also
 terminates early; create_fit_card failure is treated as a partial success and
 does not set the error field.
 
-Query parsing uses regex rather than an LLM call — the fields needed (a price
+Query parsing uses regex rather than an LLM call; the fields needed (a price
 number, a size token, leftover keywords) are cheap and deterministic to extract
 with patterns, avoiding an extra API hop and its latency/failure surface.
 
@@ -25,11 +25,10 @@ Usage:
 """
 
 import re
-
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
-# ── query parsing ─────────────────────────────────────────────────────────────
+# ── Query Parsing ─────────────────────────────────────────────────────────────
 
 # Standalone size tokens, longest-first so "XXS" is matched before "XS"/"S".
 _SIZE_TOKENS = ["XXS", "XXL", "XS", "XL", "S", "M", "L"]
@@ -83,7 +82,7 @@ def _parse_query(query: str) -> dict:
                 break
 
     # description: strip the price phrase, size phrase, and lead-ins, leaving the
-    # item keywords for search_listings to score (it drops stopwords itself).
+    # Item keywords for search_listings to score (it drops stopwords itself).
     desc = re.sub(rf"{_PRICE_PREFIX}\s*\$?\s*\d+(?:\.\d+)?(?:\s*dollars)?", "", text, flags=re.I)
     desc = re.sub(r"\$\s*\d+(?:\.\d+)?", "", desc)
     desc = re.sub(r"size\s+[a-z0-9]+", "", desc, flags=re.I)
@@ -94,13 +93,13 @@ def _parse_query(query: str) -> dict:
     return {"description": desc, "size": size, "max_price": max_price}
 
 
-# ── session state ─────────────────────────────────────────────────────────────
+# ── Session State ─────────────────────────────────────────────────────────────
 
 def _new_session(query: str, wardrobe: dict) -> dict:
     """
     Initialize and return a fresh session dict for one user interaction.
 
-    The session dict is the single source of truth for a run — it carries the
+    The session dict is the single source of truth for a run; it carries the
     original query, parsed parameters, every tool's output, and any error that
     caused early termination. run_agent() mutates this dict in place at each
     step rather than threading individual return values between calls.
@@ -114,29 +113,29 @@ def _new_session(query: str, wardrobe: dict) -> dict:
             selected_item, wardrobe, outfit_suggestion, fit_card, error.
     """
     return {
-        "query": query,              # original user query
-        "parsed": {},                # extracted description / size / max_price
-        "search_results": [],        # list of matching listing dicts
-        "selected_item": None,       # top result, passed into suggest_outfit
-        "wardrobe": wardrobe,        # user's wardrobe dict
-        "outfit_suggestion": None,   # string returned by suggest_outfit
-        "fit_card": None,            # string returned by create_fit_card
-        "error": None,               # set if the interaction ended early
+        "query": query,              # Original user query
+        "parsed": {},                # Extracted description / size / max_price
+        "search_results": [],        # List of matching listing dicts
+        "selected_item": None,       # Top result, passed into suggest_outfit
+        "wardrobe": wardrobe,        # User's wardrobe dict
+        "outfit_suggestion": None,   # String returned by suggest_outfit
+        "fit_card": None,            # String returned by create_fit_card
+        "error": None,               # Set if the interaction ended early
     }
 
 
-# ── planning loop ─────────────────────────────────────────────────────────────
+# ── Planning Loop ─────────────────────────────────────────────────────────────
 
 def run_agent(query: str, wardrobe: dict) -> dict:
     """
     Run the FitFindr planning loop for a single user interaction.
 
     Parses the query, searches listings, selects the top result, generates an
-    outfit suggestion, and produces a fit card — each step stored in the session
+    outfit suggestion, and produces a fit card; each step stored in the session
     dict. Two branches terminate early: empty search results set session["error"]
     and return before suggest_outfit is called; a suggest_outfit failure also sets
     the error and stops the loop. A create_fit_card failure is partial-success
-    only — session["fit_card"] is left as None but session["error"] stays None.
+    only; session["fit_card"] is left as None but session["error"] stays None.
 
     Args:
         query (str): Natural language user request
@@ -145,7 +144,7 @@ def run_agent(query: str, wardrobe: dict) -> dict:
             get_empty_wardrobe() from utils/data_loader.py.
 
     Returns:
-        dict: The completed session dict. Check session["error"] first — if it
+        dict: The completed session dict. Check session["error"] first. If it
             is not None the interaction ended early and outfit_suggestion and
             fit_card will be None. On partial success, fit_card may be None
             while outfit_suggestion is populated.
@@ -172,7 +171,7 @@ def run_agent(query: str, wardrobe: dict) -> dict:
 
     session["search_results"] = results
 
-    # Branch on the search result — this is the key conditional in the loop.
+    # Branch on the search result; this is the key conditional in the loop.
     # An empty list ends the interaction; we do NOT proceed to suggest_outfit.
     if not results:
         size_txt = parsed["size"] or "any size"
@@ -192,8 +191,8 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     session["selected_item"] = results[0]
 
     # Step 5 — suggest an outfit. An empty wardrobe is handled inside the tool
-    # (generic-staples fallback) and is NOT an error, so the loop continues.
-    # A genuine LLM/API failure raises; we catch it, set the error, and stop —
+    # (generic wardrobe staples fallback) and is NOT an error, so the loop continues.
+    # A genuine LLM/API failure raises; we catch it, set the error, and stop
     # create_fit_card is never called with empty input.
     try:
         outfit = suggest_outfit(session["selected_item"], wardrobe)
@@ -219,12 +218,12 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     return session
 
 
-# ── CLI test ──────────────────────────────────────────────────────────────────
+# ── CLI Test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
-    print("=== Happy path: graphic tee ===\n")
+    print("=== Happy Path: Graphic Tee ===\n")
     session = run_agent(
         query="looking for a vintage graphic tee under $30",
         wardrobe=get_example_wardrobe(),
@@ -236,7 +235,7 @@ if __name__ == "__main__":
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
 
-    print("\n\n=== No-results path ===\n")
+    print("\n\n=== No Results Path ===\n")
     session2 = run_agent(
         query="designer ballgown size XXS under $5",
         wardrobe=get_example_wardrobe(),

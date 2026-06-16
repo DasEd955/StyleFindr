@@ -24,6 +24,9 @@ def load_listings() -> list[dict]:
     missing or corrupt file so callers (e.g. search_listings) can surface a
     meaningful "search failed" error rather than an empty result.
 
+    Args:
+        None
+
     Returns:
         list[dict]: All listing dicts. Each dict carries:
             id (str), title (str), description (str),
@@ -64,6 +67,9 @@ def get_example_wardrobe() -> dict:
     navigating the top-level schema dict. Pass the result directly to run_agent()
     or suggest_outfit() as the `wardrobe` argument.
 
+    Args:
+        None
+
     Returns:
         dict: A wardrobe dict with an 'items' key holding 10 pre-filled wardrobe items.
     """
@@ -79,6 +85,9 @@ def get_empty_wardrobe() -> dict:
     suggest_outfit() handles an empty items list gracefully via a generic-staples
     fallback, so passing this is safe at every stage of the pipeline.
 
+    Args:
+        None
+
     Returns:
         dict: A wardrobe dict with an empty 'items' list.
     """
@@ -86,7 +95,7 @@ def get_empty_wardrobe() -> dict:
     return schema["empty_wardrobe"]
 
 
-# --- Quick sanity check ---
+# --- Quick Sanity Check ---
 if __name__ == "__main__":
     listings = load_listings()
     print(f"Loaded {len(listings)} listings.")

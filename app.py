@@ -1,16 +1,16 @@
 """
 app.py - Gradio interface for the FitFindr styling pipeline.
 
-The UI is intentionally thin. All search, outfit-generation, and fit-card logic
+The UI is built intentionally thin. All search, outfit generation, and fit card logic
 lives in agent.run_agent() and the three tools in tools.py; this module only
 renders the results across three output panels. handle_query() is the single
-Gradio callback — it guards against empty input, selects the wardrobe, delegates
+Gradio callback; it guards against empty input, selects the wardrobe, delegates
 to run_agent(), and maps the session dict to (listing_text, outfit_text, fit_card_text).
 
 The three private _format_* helpers convert raw dicts from the session into
 human-readable strings for the Textbox panels. A per-session wardrobe is
-chosen at submit time via a radio button (example vs. empty), so new-user and
-existing-wardrobe flows are exercised through the same code path.
+chosen at submit time via a radio button (example vs. empty), so `new-user` and
+`existing-wardrobe` flows are exercised through the same code path.
 
 Run with:
     python app.py
@@ -19,12 +19,11 @@ Then open the localhost URL shown in your terminal (usually http://localhost:786
 """
 
 import gradio as gr
-
 from agent import run_agent
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
-# ── query handler ─────────────────────────────────────────────────────────────
+# ── Query Handler ─────────────────────────────────────────────────────────────
 
 def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     """
@@ -60,7 +59,7 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     # 3. Run the planning loop.
     session = run_agent(user_query.strip(), wardrobe)
 
-    # 4. Early-termination paths (empty results, search/outfit failure) surface
+    # 4. Early termination paths (empty results, search/outfit failure) surface
     #    the error in the first panel and leave the other two empty.
     if session["error"]:
         return session["error"], "", ""
@@ -73,11 +72,11 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     )
 
 
-# ── output formatting ───────────────────────────────────────────────────────
+# ── Output Formatting ───────────────────────────────────────────────────────
 
 def _format_listing(item: dict) -> str:
     """
-    Render a listing dict into a human-readable string for the top-listing panel.
+    Render a listing dict into a human-readable string for the top listing panel.
 
     Args:
         item (dict): A listing dict from session["selected_item"].
@@ -150,14 +149,14 @@ def _format_fit_card(fit_card: dict | None) -> str:
     return "\n".join(lines).strip()
 
 
-# ── interface ─────────────────────────────────────────────────────────────────
+# ── Interface ─────────────────────────────────────────────────────────────────
 
 EXAMPLE_QUERIES = [
     "vintage graphic tee under $30",
     "90s track jacket in size M",
     "flowy midi skirt under $40",
     "black combat boots size 8",
-    "designer ballgown size XXS under $5",   # deliberate no-results test
+    "designer ballgown size XXS under $5",   # Deliberate no-results test
 ]
 
 def build_interface():
@@ -175,8 +174,8 @@ def build_interface():
     with gr.Blocks(title="FitFindr") as demo:
         gr.Markdown("""
 # FitFindr 🛍️
-Find secondhand pieces and get outfit ideas based on your wardrobe.
-Describe what you're looking for — include size and price if you want to filter.
+Find secondhand pieces & get outfit ideas based on your wardrobe.
+Describe what you're looking for. Include size and price if you want to filter.
         """)
 
         with gr.Row():
