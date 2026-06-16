@@ -149,6 +149,32 @@ The implementation follows the planning.md spec closely. The three tools cover e
 
 ---
 
+## AI Usage
+
+Two specific instances where AI tooling shaped this project during implementation; documented with what was given as input, what was produced, and what was changed before the output was used.
+
+---
+
+### Instance 1 — Stress-testing the planning loop against failure modes
+
+**Input given to Claude:** The full draft Tool 1–3 specs & the planning loop pseudocode from `planning.md`, framed as: *"Review this as a senior engineer. What edge cases am I not handling & how is my progress thus far?"*
+
+**What Claude produced:** A critique that identified several gaps. The most significant was around API failure handling: the draft loop called `suggest_outfit` and `create_fit_card` with no distinction between the two failure types: an LLM call returning empty output versus an LLM call throwing an exception entirely. Claude pointed out that conflating these would either swallow hard failures silently or treat a missing fit card as a session ending error, when the right behavior was to degrade gracefully. It also flagged that `create_fit_card` failing should be a *partial success* rather than a stop condition, since the outfit is still valid and useful without a caption.
+
+**What was changed before use:** The degraded success pattern for `create_fit_card` was already implied in my draft but not explicit; Claude's framing clarified the distinction. I kept my existing error message wording and the structure of the existing edge case table, then added the explicit partial-success path (`session["fit_card"] = None`, loop continues) and the two separate exception blocks in `run_agent()`: one that stops the session (outfit failure) and one that does not (fit card failure). The session key name (`"error"` vs. `"error_message"`) and the exact user-facing message strings were written by me to match the tone of the rest of the project.
+
+---
+
+### Instance 2 — Fixing a broken relevance filter and size system collision
+
+**Input given to Claude:** A failing query and a reproducible bug. The query `"pair of black combat boots size medium we could keep under $40 if possible please"` with `size="Medium"` was returning a western-tagged belt as the top result instead of any boots. Two distinct problems were at play: (1) the word `"we"` in the query was substring-matching `"western"` in the listing's style tags, inflating the belt's relevance score; and (2) the size filter was excluding numeric sized shoes (`"US 8"`) when an apparel size like `"Medium"` was requested. In concrete terms: semantically incompatible systems were being compared directly. I described both bugs to Claude & asked for a refactor of the filtering and scoring logic to be robust against both.
+
+**What Claude produced:** A revised `search_listings` implementation with two key additions: a token-set intersection approach to relevance scoring (replacing substring `in` checks with whole-word token matching via a `_tokens()` helper), and a `_size_matches()` function that treats alpha apparel sizes and numeric shoe/waist sizes as separate systems, passing through cross-system comparisons rather than filtering them out. It also produced a `_STOPWORDS` set to drop conversational filler before scoring.
+
+**What was changed before use:** The core logic was sound and adopted as-is. Several variable names were renamed to match the existing naming convention in the file. The `_STOPWORDS` set was extended with additional filler terms from my own test queries that Claude's version missed. All docstrings were rewritten from scratch & the generated versions described implementation details already obvious from the code; the final docstrings explain the *why* (e.g., the cross-system reasoning in `_size_matches` that explains the "One Size" and numeric pass-through rules). The two regression tests (`test_search_whole_word_match_no_substring_leak`, `test_search_apparel_size_does_not_exclude_shoes`) were written by me after verifying the fix, not generated.
+
+---
+
 <!--
 ## Original Starter Kit README (commented out; preserved for reference)
 
