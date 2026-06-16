@@ -1,17 +1,21 @@
 """
-Tests for the FitFindr planning loop (agent.py) and the Gradio query handler
-(app.py).
+test_agent.py - Tests for the FitFindr planning loop (agent.py) and the Gradio
+query handler (app.py).
+
+Covers query parsing, object-identity state passing between tools, and the four
+conditional branches in run_agent(): full success, empty search results, outfit
+failure, and partial success when create_fit_card fails. Also covers the three
+app.handle_query() paths: empty input, success mapping to all three panels, and
+error surfacing in the first panel.
+
+The two LLM-backed tools call Groq, so tests monkeypatch tools._chat with canned
+JSON, keeping the suite fast, deterministic, and runnable without a GROQ_API_KEY.
+agent imports the tool functions into its own namespace, so failure simulations
+patch agent.<tool> directly rather than tools.<tool>.
 
 Run from the project root:
 
     pytest tests/
-
-These cover the Milestone 4 behaviours: query parsing, state passing between
-tools, and the conditional branches in the planning loop. The two LLM-backed
-tools call Groq, so we monkeypatch `tools._chat` — that keeps the suite fast,
-deterministic, and runnable without a GROQ_API_KEY. `agent` imports the tool
-functions into its own namespace, so failure simulations patch `agent.<tool>`
-directly.
 """
 
 import json
@@ -41,8 +45,14 @@ EMPTY_WARDROBE = {"items": []}
 
 @pytest.fixture
 def fake_llm(monkeypatch):
-    """Replace tools._chat with canned JSON so suggest_outfit/create_fit_card
-    return valid contract dicts without hitting the network."""
+    """
+    Replace tools._chat with a canned-JSON stub for the duration of a test.
+
+    The stub returns a single JSON blob that satisfies both the suggest_outfit
+    and create_fit_card contract shapes, so both tools return valid dicts without
+    making any network calls. Patch target is tools._chat (not agent._chat) because
+    suggest_outfit and create_fit_card call it directly through the tools module.
+    """
 
     def _fake(messages, temperature, json_mode=False):
         return json.dumps(
@@ -60,9 +70,10 @@ def fake_llm(monkeypatch):
     monkeypatch.setattr(tools, "_chat", _fake)
 
 
-# ── query parsing ────────────────────────────────────────────────────────────
+# ── Query Parsing ────────────────────────────────────────────────────────────
 
 def test_parse_query_extracts_all_fields():
+    """Verify _parse_query correctly extracts description, size, and max_price from a full query."""
     parsed = _parse_query("vintage cashmere sweater under $200, size L")
     assert parsed["description"] == "vintage cashmere sweater"
     assert parsed["size"] == "L"
@@ -70,6 +81,7 @@ def test_parse_query_extracts_all_fields():
 
 
 def test_parse_query_no_size():
+    """Verify _parse_query returns size=None and still extracts max_price and description keywords when no size is present."""
     parsed = _parse_query("looking for a vintage graphic tee under $30")
     assert parsed["size"] is None
     assert parsed["max_price"] == 30.0
@@ -77,15 +89,16 @@ def test_parse_query_no_size():
 
 
 def test_parse_query_multichar_size_token():
-    # "XXS" must win over "XS"/"S" — longest-token-first matching.
+    """Verify _parse_query matches "XXS" before "XS" or "S" due to longest-token-first ordering."""
     parsed = _parse_query("designer ballgown size XXS under $5")
     assert parsed["size"] == "XXS"
     assert parsed["max_price"] == 5.0
 
 
-# ── planning loop: happy path + state passing ────────────────────────────────
+# ── Planning Loop: Happy Path + State Passing ────────────────────────────────
 
 def test_full_success_path(fake_llm):
+    """Verify run_agent completes all steps with no error and populates selected_item, outfit_suggestion, and fit_card."""
     session = run_agent("vintage graphic tee under $30", EXAMPLE_WARDROBE)
     assert session["error"] is None
     assert session["selected_item"] is not None
@@ -94,7 +107,7 @@ def test_full_success_path(fake_llm):
 
 
 def test_state_passes_by_identity(monkeypatch, fake_llm):
-    # The EXACT objects must flow between steps — no re-prompting or rebuilding.
+    """Verify run_agent passes the exact same objects between steps rather than rebuilding them."""
     captured = {}
     orig_suggest, orig_fc = agent.suggest_outfit, agent.create_fit_card
 
@@ -117,10 +130,10 @@ def test_state_passes_by_identity(monkeypatch, fake_llm):
     assert captured["fc_new_item"] is session["selected_item"]
 
 
-# ── planning loop: conditional branches ──────────────────────────────────────
+# ── Planning Loop: Conditional Branches ──────────────────────────────────────
 
 def test_empty_results_stops_loop(monkeypatch):
-    # No matches → error set, fit_card stays None, suggest_outfit NEVER called.
+    """Verify that empty search results set session["error"] and prevent suggest_outfit from being called."""
     called = {"suggest": False}
 
     def must_not_run(*a, **k):
@@ -139,7 +152,7 @@ def test_empty_results_stops_loop(monkeypatch):
 
 
 def test_empty_wardrobe_continues_to_fit_card(fake_llm):
-    # Empty wardrobe is a fallback, NOT an error: the loop runs end to end.
+    """Verify that an empty wardrobe triggers the generic wardrobe staples fallback and the loop still completes."""
     session = run_agent("vintage graphic tee under $30", EMPTY_WARDROBE)
     assert session["error"] is None
     assert session["outfit_suggestion"]["outfit_description"]
@@ -147,7 +160,7 @@ def test_empty_wardrobe_continues_to_fit_card(fake_llm):
 
 
 def test_suggest_outfit_failure_stops_loop(monkeypatch):
-    # suggest_outfit failure → error set, loop stops, create_fit_card NOT called.
+    """Verify that a suggest_outfit exception sets session["error"] and prevents create_fit_card from being called."""
     called = {"fit_card": False}
 
     def boom(*a, **k):
@@ -163,14 +176,14 @@ def test_suggest_outfit_failure_stops_loop(monkeypatch):
     session = run_agent("vintage graphic tee under $30", EXAMPLE_WARDROBE)
 
     assert session["error"] == "Outfit generation failed. Please try again."
-    assert session["selected_item"] is not None  # state up to step 4 is kept
+    assert session["selected_item"] is not None  # State up to step 4 is kept
     assert session["outfit_suggestion"] is None
     assert session["fit_card"] is None
     assert called["fit_card"] is False
 
 
 def test_fit_card_failure_is_partial_success(monkeypatch, fake_llm):
-    # create_fit_card failure must NOT error the run — outfit is still kept.
+    """Verify that a create_fit_card exception leaves session["error"] as None and preserves outfit_suggestion."""
     def boom(*a, **k):
         raise RuntimeError("simulated caption error")
 
@@ -183,15 +196,17 @@ def test_fit_card_failure_is_partial_success(monkeypatch, fake_llm):
     assert session["fit_card"] is None
 
 
-# ── app.handle_query mapping ─────────────────────────────────────────────────
+# ── app.handle_query Mapping ─────────────────────────────────────────────────
 
 def test_handle_query_empty_input():
+    """Verify app.handle_query returns an error prompt in the first panel and empty strings for the other two on blank input."""
     listing, outfit, fit_card = app.handle_query("   ", "Example wardrobe")
     assert "enter" in listing.lower()
     assert outfit == "" and fit_card == ""
 
 
 def test_handle_query_success_maps_three_panels(fake_llm):
+    """Verify app.handle_query populates all three output panels on a successful run."""
     listing, outfit, fit_card = app.handle_query(
         "vintage graphic tee under $30", "Example wardrobe"
     )
@@ -202,6 +217,7 @@ def test_handle_query_success_maps_three_panels(fake_llm):
 
 
 def test_handle_query_error_goes_to_first_panel():
+    """Verify app.handle_query surfaces session["error"] in the first panel and leaves the other two empty."""
     listing, outfit, fit_card = app.handle_query(
         "designer ballgown size XXS under $5", "Example wardrobe"
     )

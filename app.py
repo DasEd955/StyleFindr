@@ -1,15 +1,21 @@
 """
-app.py
+app.py - Gradio interface for the FitFindr styling pipeline.
 
-Gradio interface for FitFindr. The layout and wiring are already set up —
-your job is to fill in handle_query() so it calls run_agent() and maps
-the session results to the three output panels.
+The UI is intentionally thin. All search, outfit-generation, and fit-card logic
+lives in agent.run_agent() and the three tools in tools.py; this module only
+renders the results across three output panels. handle_query() is the single
+Gradio callback — it guards against empty input, selects the wardrobe, delegates
+to run_agent(), and maps the session dict to (listing_text, outfit_text, fit_card_text).
+
+The three private _format_* helpers convert raw dicts from the session into
+human-readable strings for the Textbox panels. A per-session wardrobe is
+chosen at submit time via a radio button (example vs. empty), so new-user and
+existing-wardrobe flows are exercised through the same code path.
 
 Run with:
     python app.py
 
-Then open the localhost URL shown in your terminal (usually http://localhost:7860,
-but check your terminal — the port may differ).
+Then open the localhost URL shown in your terminal (usually http://localhost:7860).
 """
 
 import gradio as gr
@@ -22,26 +28,23 @@ from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     """
-    Called by Gradio when the user submits a query.
+    Handle one Gradio submit event and return the three output panel strings.
+
+    Guards against an empty query, selects the wardrobe based on the radio
+    choice, delegates the full pipeline to run_agent(), and maps the resulting
+    session dict to the three Textbox panels. On early termination (empty
+    results or outfit failure) the error surfaces in the first panel and the
+    other two are returned as empty strings.
 
     Args:
-        user_query:     The text the user typed into the search box.
-        wardrobe_choice: Either "Example wardrobe" or "Empty wardrobe (new user)".
+        user_query (str): The text the user typed into the search box.
+        wardrobe_choice (str): Radio value — "Example wardrobe" or
+            "Empty wardrobe (new user)".
 
     Returns:
-        A tuple of three strings:
-            (listing_text, outfit_suggestion, fit_card)
-        Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
+        tuple[str, str, str]: (listing_text, outfit_text, fit_card_text).
+            Each string maps to one of the three output Textbox panels.
+            On error, only the first string is non-empty.
     """
     # 1. Guard against an empty query.
     if not user_query or not user_query.strip():
@@ -73,7 +76,16 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
 # ── output formatting ───────────────────────────────────────────────────────
 
 def _format_listing(item: dict) -> str:
-    """Render the selected listing dict into a readable panel string."""
+    """
+    Render a listing dict into a human-readable string for the top-listing panel.
+
+    Args:
+        item (dict): A listing dict from session["selected_item"].
+
+    Returns:
+        str: Multi-line text with title, price, platform, condition, size, and
+            optional brand and style tags.
+    """
     price = item.get("price")
     price_str = f"${price:.2f}" if isinstance(price, (int, float)) else "n/a"
     tags = ", ".join(item.get("style_tags", []))
@@ -90,7 +102,17 @@ def _format_listing(item: dict) -> str:
 
 
 def _format_outfit(outfit: dict) -> str:
-    """Render the suggest_outfit dict into a readable panel string."""
+    """
+    Render a suggest_outfit result dict into a human-readable string for the outfit panel.
+
+    Args:
+        outfit (dict): The outfit dict from session["outfit_suggestion"], containing
+            outfit_description, matching_items, style_reasoning, and style_category.
+
+    Returns:
+        str: Multi-line text combining all four outfit fields, with blank lines
+            separating the pieces, reasoning, and vibe label.
+    """
     lines = [outfit.get("outfit_description", "")]
     if outfit.get("matching_items"):
         lines.append("\nPieces: " + ", ".join(outfit["matching_items"]))
@@ -103,11 +125,19 @@ def _format_outfit(outfit: dict) -> str:
 
 def _format_fit_card(fit_card: dict | None) -> str:
     """
-    Render the create_fit_card dict into a readable panel string.
+    Render a create_fit_card result dict into a human-readable string for the fit-card panel.
 
-    fit_card is None when the caption step failed (a partial success): the
-    outfit is still shown, and this panel notes the degraded result rather
-    than crashing or hiding the rest of the output.
+    fit_card is None when the caption step failed (partial success): the outfit
+    panel is still populated, and this panel displays a degraded-result notice
+    rather than crashing or hiding the rest of the output.
+
+    Args:
+        fit_card (dict | None): The fit card dict from session["fit_card"], or None
+            on partial success. Expected keys: fit_card_text, style_tags, caption_tone.
+
+    Returns:
+        str: The caption text, hashtag-style tags, and tone label joined as
+            multi-line text; or a fallback message when fit_card is None.
     """
     if not fit_card:
         return "Fit card generation failed — see your outfit suggestion instead."
@@ -131,6 +161,17 @@ EXAMPLE_QUERIES = [
 ]
 
 def build_interface():
+    """
+    Build and return the Gradio Blocks interface for FitFindr.
+
+    Constructs the full UI: a query textbox, wardrobe radio selector, submit
+    button, three output Textbox panels, and a set of example queries. Both the
+    button click and the textbox Enter key are wired to handle_query(). The
+    returned demo object is launched by the __main__ guard.
+
+    Returns:
+        gr.Blocks: The assembled Gradio interface, ready for .launch().
+    """
     with gr.Blocks(title="FitFindr") as demo:
         gr.Markdown("""
 # FitFindr 🛍️

@@ -1,7 +1,11 @@
 """
-Utility functions for loading the mock listings dataset and wardrobe schema.
-Use these in your tool implementations to access the data without re-reading
-the files each time.
+data_loader.py - Utility helpers for loading the mock listings dataset and wardrobe schema.
+
+All data lives in the sibling `data/` directory as JSON files. The helpers
+here resolve paths relative to this file so they work regardless of the
+working directory. `load_listings` and `load_wardrobe_schema` are the primary
+loaders; `get_example_wardrobe` and `get_empty_wardrobe` are thin convenience
+wrappers that spare callers from navigating the schema dict keys.
 """
 
 import json
@@ -14,21 +18,19 @@ _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
 def load_listings() -> list[dict]:
     """
-    Load all mock listings from the dataset.
+    Load and return all mock listings from the dataset JSON file.
+
+    Reads data/listings.json relative to this file's directory. Raises on a
+    missing or corrupt file so callers (e.g. search_listings) can surface a
+    meaningful "search failed" error rather than an empty result.
 
     Returns:
-        A list of listing dictionaries. Each listing has the following fields:
-        - id (str)
-        - title (str)
-        - description (str)
-        - category (str): one of tops, bottoms, outerwear, shoes, accessories
-        - style_tags (list[str])
-        - size (str)
-        - condition (str): excellent, good, or fair
-        - price (float)
-        - colors (list[str])
-        - brand (str or None)
-        - platform (str): depop, thredUp, or poshmark
+        list[dict]: All listing dicts. Each dict carries:
+            id (str), title (str), description (str),
+            category (str — tops/bottoms/outerwear/shoes/accessories),
+            style_tags (list[str]), size (str), condition (str — excellent/good/fair),
+            price (float), colors (list[str]), brand (str | None),
+            platform (str — depop/thredUp/poshmark).
     """
     path = os.path.join(_DATA_DIR, "listings.json")
     with open(path, "r", encoding="utf-8") as f:
@@ -37,13 +39,17 @@ def load_listings() -> list[dict]:
 
 def load_wardrobe_schema() -> dict:
     """
-    Load the wardrobe schema, including the example wardrobe and empty template.
+    Load and return the full wardrobe schema file, including field definitions,
+    an example wardrobe, and an empty template.
+
+    Args:
+        None
 
     Returns:
-        A dictionary containing:
-        - schema: the field definitions for a wardrobe item
-        - example_wardrobe: a sample wardrobe with 10 items
-        - empty_wardrobe: a starting template for a new user
+        dict: A top-level dict with three keys:
+            schema (dict): field definitions for a single wardrobe item,
+            example_wardrobe (dict): a sample wardrobe with 10 pre-filled items,
+            empty_wardrobe (dict): a starting template with an empty items list.
     """
     path = os.path.join(_DATA_DIR, "wardrobe_schema.json")
     with open(path, "r", encoding="utf-8") as f:
@@ -52,10 +58,14 @@ def load_wardrobe_schema() -> dict:
 
 def get_example_wardrobe() -> dict:
     """
-    Convenience function — returns just the example wardrobe items list.
+    Return the example wardrobe from the schema file.
+
+    Convenience wrapper around load_wardrobe_schema() that spares callers from
+    navigating the top-level schema dict. Pass the result directly to run_agent()
+    or suggest_outfit() as the `wardrobe` argument.
 
     Returns:
-        A wardrobe dict with an 'items' key containing a list of wardrobe items.
+        dict: A wardrobe dict with an 'items' key holding 10 pre-filled wardrobe items.
     """
     schema = load_wardrobe_schema()
     return schema["example_wardrobe"]
@@ -63,10 +73,14 @@ def get_example_wardrobe() -> dict:
 
 def get_empty_wardrobe() -> dict:
     """
-    Convenience function — returns an empty wardrobe template.
+    Return the empty wardrobe template from the schema file.
+
+    Convenience wrapper around load_wardrobe_schema() for the new-user flow.
+    suggest_outfit() handles an empty items list gracefully via a generic-staples
+    fallback, so passing this is safe at every stage of the pipeline.
 
     Returns:
-        A wardrobe dict with an empty 'items' list.
+        dict: A wardrobe dict with an empty 'items' list.
     """
     schema = load_wardrobe_schema()
     return schema["empty_wardrobe"]
