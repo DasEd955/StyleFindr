@@ -1,9 +1,7 @@
 # FitFindr — planning.md
 
-> Complete this document before writing any implementation code.
-> Your spec and agent diagram are what you'll use to direct AI tools to generate your implementation — the more specific they are, the more useful the generated code will be.
-> Your planning.md will be reviewed as part of your submission.
-> Update it before starting any stretch features.
+> **Status: Implementation complete.** All three tools are implemented and tested. The planning loop, state management, and error handling described below match the final code in `tools.py`, `agent.py`, and `app.py`.
+> This document was written before implementation and updated to reflect what actually shipped, including deviations noted in the Spec Reflection section of README.md.
 
 ---
 
@@ -320,3 +318,46 @@ Fit card:
 If `search_listings` returns `[]`:
 > "No listings matched 'vintage cashmere sweater' in size L under $200. Try raising your budget, searching a broader term like 'cashmere sweater', or removing the size filter."
 > Agent stops. `suggest_outfit` is never called.
+
+---
+
+## Implementation State
+
+### What shipped vs. what was planned
+
+**`search_listings` (tools.py:190)**
+- Implemented as planned. Added `_STOPWORDS`, `_tokens()`, and whole-word token matching to prevent substring noise (e.g., `"we"` matching `"western"` style tags).
+- Size filtering required a dedicated `_size_matches()` function to handle two incompatible sizing systems (alpha apparel vs. numeric shoe/waist). Cross-system requests pass through without excluding unrelated categories.
+- Relevance is scored by `_relevance_score()` with weighted tiers: style tags (3pts) > title/colors/category/brand (2pts) > description (1pt). Ties broken by price ascending.
+
+**`suggest_outfit` (tools.py:297)**
+- Return type is `dict` (not `str`) with keys `outfit_description`, `matching_items`, `style_reasoning`, `style_category`. This matches the spec.
+- Empty wardrobe triggers a different prompt branch, not a failure. The LLM is asked for generic staples; the description flags them as suggestions.
+- `_normalize_outfit()` ensures all four contract keys exist regardless of LLM output shape.
+
+**`create_fit_card` (tools.py:403)**
+- Returns `dict` with keys `fit_card_text`, `style_tags`, `caption_tone`.
+- Runs at `temperature=1.0` for caption variety.
+- Missing or empty `outfit_description` routes to a simplified item-only prompt (no crash, no None return).
+- `style_tags` is capped at 4 items by `_normalize_fit_card()`.
+
+**Planning loop (agent.py:110)**
+- `_parse_query()` (regex) extracts `description`, `size`, `max_price` — no LLM call at parse time.
+- `create_fit_card` failure is a partial success: `session["fit_card"] = None`, session still returned.
+- Session dict uses `"error"` key (not `"error_message"` as originally spec'd — simplified for consistency).
+
+**Gradio UI (app.py)**
+- `handle_query()` maps the session dict to three output panels via `_format_listing()`, `_format_outfit()`, `_format_fit_card()`.
+- `_format_fit_card(None)` returns a graceful degraded message rather than crashing.
+
+### Files
+
+| File | Role |
+|------|------|
+| [tools.py](tools.py) | All three tools + LLM helpers |
+| [agent.py](agent.py) | Planning loop, query parser, session state |
+| [app.py](app.py) | Gradio UI, query handler, output formatters |
+| [tests/test_tools.py](tests/test_tools.py) | 11 pytest tests covering all tools and failure modes |
+| [utils/data_loader.py](utils/data_loader.py) | Dataset + wardrobe loaders |
+| [data/listings.json](data/listings.json) | 40 mock secondhand listings |
+| [data/wardrobe_schema.json](data/wardrobe_schema.json) | Wardrobe format + example wardrobe |
