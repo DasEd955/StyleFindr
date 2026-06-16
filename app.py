@@ -43,8 +43,81 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
            string and return it along with session["outfit_suggestion"] and
            session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    # 1. Guard against an empty query.
+    if not user_query or not user_query.strip():
+        return "Please enter what you're looking for.", "", ""
+
+    # 2. Select the wardrobe based on the radio choice.
+    wardrobe = (
+        get_empty_wardrobe()
+        if wardrobe_choice == "Empty wardrobe (new user)"
+        else get_example_wardrobe()
+    )
+
+    # 3. Run the planning loop.
+    session = run_agent(user_query.strip(), wardrobe)
+
+    # 4. Early-termination paths (empty results, search/outfit failure) surface
+    #    the error in the first panel and leave the other two empty.
+    if session["error"]:
+        return session["error"], "", ""
+
+    # 5. Map the session dict to the three panel strings.
+    return (
+        _format_listing(session["selected_item"]),
+        _format_outfit(session["outfit_suggestion"]),
+        _format_fit_card(session["fit_card"]),
+    )
+
+
+# ── output formatting ───────────────────────────────────────────────────────
+
+def _format_listing(item: dict) -> str:
+    """Render the selected listing dict into a readable panel string."""
+    price = item.get("price")
+    price_str = f"${price:.2f}" if isinstance(price, (int, float)) else "n/a"
+    tags = ", ".join(item.get("style_tags", []))
+    lines = [
+        item.get("title", "Untitled listing"),
+        f"{price_str} · {item.get('platform', 'n/a')} · {item.get('condition', 'n/a')} condition",
+        f"Size: {item.get('size', 'n/a')}",
+    ]
+    if item.get("brand"):
+        lines.append(f"Brand: {item['brand']}")
+    if tags:
+        lines.append(f"Style: {tags}")
+    return "\n".join(lines)
+
+
+def _format_outfit(outfit: dict) -> str:
+    """Render the suggest_outfit dict into a readable panel string."""
+    lines = [outfit.get("outfit_description", "")]
+    if outfit.get("matching_items"):
+        lines.append("\nPieces: " + ", ".join(outfit["matching_items"]))
+    if outfit.get("style_reasoning"):
+        lines.append(f"\nWhy it works: {outfit['style_reasoning']}")
+    if outfit.get("style_category"):
+        lines.append(f"\nVibe: {outfit['style_category']}")
+    return "\n".join(lines).strip()
+
+
+def _format_fit_card(fit_card: dict | None) -> str:
+    """
+    Render the create_fit_card dict into a readable panel string.
+
+    fit_card is None when the caption step failed (a partial success): the
+    outfit is still shown, and this panel notes the degraded result rather
+    than crashing or hiding the rest of the output.
+    """
+    if not fit_card:
+        return "Fit card generation failed — see your outfit suggestion instead."
+    lines = [fit_card.get("fit_card_text", "")]
+    tags = fit_card.get("style_tags", [])
+    if tags:
+        lines.append("\n" + " ".join(f"#{t.replace(' ', '')}" for t in tags))
+    if fit_card.get("caption_tone"):
+        lines.append(f"\nTone: {fit_card['caption_tone']}")
+    return "\n".join(lines).strip()
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
