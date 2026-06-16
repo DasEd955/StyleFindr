@@ -57,10 +57,26 @@ def _chat(messages: list[dict], temperature: float, json_mode: bool = False) -> 
 
 # Common words that carry no search signal — dropped from query keywords so they
 # don't inflate relevance scores (e.g. "a vintage tee for me" → ["vintage", "tee"]).
+# Includes conversational filler ("looking for a new pair under my budget, thanks!")
+# so polite, full-sentence queries don't leak noise words into the relevance score.
 _STOPWORDS = {
-    "a", "an", "the", "for", "with", "in", "of", "and", "or", "to",
-    "my", "i", "me", "some", "looking", "want", "need", "size",
+    # articles, prepositions, conjunctions
+    "a", "an", "the", "for", "with", "in", "of", "and", "or", "to", "on", "at",
+    "by", "from", "as", "is", "are", "be", "than", "then", "so", "but",
+    # pronouns / contractions
+    "my", "i", "im", "me", "we", "us", "you", "your", "it", "its",
+    # search / request filler
+    "some", "looking", "look", "want", "need", "find", "show", "get", "size",
+    "new", "pair", "most", "prefer", "could", "would", "should", "keep",
+    "budget", "less", "more", "possible", "thank", "thanks", "if", "please",
+    "just", "really", "also", "like", "can", "this", "that", "these", "those",
+    "maybe", "around", "about", "under", "over",
 }
+
+
+def _tokens(text: str) -> set[str]:
+    """Lower-case word tokens of a string, as a set (for whole-word matching)."""
+    return {t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t}
 
 
 def _extract_keywords(description: str) -> list[str]:
@@ -71,54 +87,100 @@ def _extract_keywords(description: str) -> list[str]:
     return [t for t in tokens if len(t) >= 2 and t not in _STOPWORDS]
 
 
+# Alpha clothing sizes, in one set so we can tell an apparel size ("M") apart from
+# a shoe/waist size ("8", "W30"). Word forms are normalized to these letters.
+_ALPHA_SIZES = {"XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL"}
+_SIZE_WORDS = {
+    "XSMALL": "XS", "SMALL": "S", "MEDIUM": "M", "LARGE": "L",
+    "XLARGE": "XL", "EXTRALARGE": "XL",
+}
+
+
+def _normalize_size_token(tok: str) -> str:
+    """Map a word-form size to its letter form ("MEDIUM" → "M"); else pass through."""
+    return _SIZE_WORDS.get(tok, tok)
+
+
 def _size_matches(requested: str, listing_size: str) -> bool:
     """
     True if a listing's size satisfies the requested size.
 
-    Sizes in the dataset are inconsistent ("S/M", "XL (oversized)", "M/L",
-    "One Size / Oversized", "W30 L30", "US 7"). We tokenize the listing size
-    and check for an exact token match so "M" matches "S/M" and "M/L" but NOT
-    "XL" (which a naive substring check would wrongly catch). "One Size" items
-    fit anyone, so they match any requested size.
+    Sizes in the dataset use two *different systems*: alpha apparel sizes
+    ("S/M", "XL (oversized)", "M/L") and numeric shoe/waist sizes ("US 7",
+    "W30 L30"). The key rule: a request only filters within its OWN system.
+    Asking for "Medium" (apparel) must NOT exclude shoes sized "US 8" — they
+    aren't comparable, so we leave them in and let relevance ranking decide.
+    This prevents a clothing-size request from silently wiping out the entire
+    shoe category (the bug that surfaced a "One Size" belt for a boots query).
+
+    Rules:
+      - "One Size" items fit anyone → always match.
+      - Apparel request (S/M/L/...) vs an apparel listing → exact token match
+        ("M" matches "S/M" and "M/L" but NOT "XL").
+      - Numeric request (8, 8.5) vs a numeric listing → matching number present.
+      - Cross-system (apparel request vs numeric listing, or vice versa) → not
+        comparable, so do NOT exclude (return True).
     """
     if not requested:
         return True
-    req = requested.strip().upper()
+
+    req = _normalize_size_token(requested.strip().upper())
     listing = (listing_size or "").upper()
 
     # Universal-fit items satisfy every request.
     if "ONE SIZE" in listing:
         return True
 
-    tokens = [t for t in re.split(r"[^A-Z0-9]+", listing) if t]
-    return req in tokens
+    # `listing` is already upper-cased; split directly (do NOT use _tokens, which
+    # lower-cases and would never match the upper-case size sets).
+    raw_tokens = [t for t in re.split(r"[^A-Z0-9]+", listing) if t]
+    listing_tokens = {_normalize_size_token(t) for t in raw_tokens}
+    listing_alpha = listing_tokens & _ALPHA_SIZES
+    listing_numbers = {float(n) for n in re.findall(r"\d+(?:\.\d+)?", listing)}
+
+    if req in _ALPHA_SIZES:
+        # Apparel request: filter only against apparel listings.
+        if listing_alpha:
+            return req in listing_alpha
+        return True  # listing has no apparel size (e.g. shoes) — not comparable
+    if re.fullmatch(r"\d+(?:\.\d+)?", req):
+        # Numeric request: filter only against numeric listings.
+        if listing_numbers:
+            return float(req) in listing_numbers
+        return True  # listing has no numeric size — not comparable
+    # Unrecognized request format → don't exclude on size.
+    return True
 
 
 def _relevance_score(listing: dict, keywords: list[str]) -> int:
     """
     Weighted keyword-overlap score. Style tags are the strongest signal,
     then title/colors/category/brand, then the free-text description.
+
+    Matching is whole-word (token-based), NOT substring: "we" must not match
+    "western" and "boots" must not match "bootleg". Substring matching let
+    conversational filler score against unrelated listings.
     """
-    title = listing.get("title", "").lower()
-    desc = listing.get("description", "").lower()
+    title_tokens = _tokens(listing.get("title", ""))
+    desc_tokens = _tokens(listing.get("description", ""))
     category = listing.get("category", "").lower()
-    brand = (listing.get("brand") or "").lower()
-    tag_text = " ".join(listing.get("style_tags", [])).lower()
-    color_text = " ".join(listing.get("colors", [])).lower()
+    brand_tokens = _tokens(listing.get("brand") or "")
+    tag_tokens = _tokens(" ".join(listing.get("style_tags", [])))
+    color_tokens = _tokens(" ".join(listing.get("colors", [])))
 
     score = 0
     for kw in keywords:
-        if kw in tag_text:
+        if kw in tag_tokens:
             score += 3
-        if kw in title:
+        if kw in title_tokens:
             score += 2
-        if kw in color_text:
+        if kw in color_tokens:
             score += 2
         if kw == category:
             score += 2
-        if brand and kw in brand:
+        if kw in brand_tokens:
             score += 2
-        if kw in desc:
+        if kw in desc_tokens:
             score += 1
     return score
 

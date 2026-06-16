@@ -67,12 +67,43 @@ def test_search_price_filter():
 
 
 def test_search_size_filter():
-    # "M" must match "S/M" / "M/L" tokens but never leak in larger sizes.
+    # An apparel-size request filters STRICTLY within the alpha system: a result
+    # that carries an alpha size must contain "M" ("S/M", "M/L" pass; "L"/"XL"
+    # are excluded). Items sized in a different system (numeric shoe/waist sizes
+    # like "US 8", "W29") or "One Size" are not comparable to "M", so they are
+    # not excluded on size — relevance ranking decides those.
+    import re
+
+    _ALPHA = {"XS", "S", "M", "L", "XL", "XXL", "XXS", "XXXL"}
     results = search_listings("tee", size="M", max_price=200)
-    assert all(
-        "M" in [t for t in item["size"].replace("/", " ").split()]
-        or "ONE SIZE" in item["size"].upper()
-        for item in results
+    for item in results:
+        size = item["size"].upper()
+        tokens = set(re.split(r"[^A-Z0-9]+", size)) - {""}
+        alpha_tokens = tokens & _ALPHA
+        if alpha_tokens:                      # apparel-sized → must include M
+            assert "M" in alpha_tokens, f"{item['title']} ({size}) leaked into size M"
+        # else: numeric / One Size → not comparable, allowed through.
+
+
+def test_search_whole_word_match_no_substring_leak():
+    # Regression: conversational filler must not score via substring overlap.
+    # "we" (from "...we could keep...") used to match "western" tags, surfacing
+    # an unrelated "One Size" belt as the top hit for a boots query.
+    results = search_listings(
+        "new pair of combat boots we could keep cheap", size=None, max_price=200
+    )
+    titles = [r["title"].lower() for r in results]
+    assert not any("belt" in t for t in titles), (
+        "noise word matched a western-tagged belt via substring overlap"
+    )
+
+
+def test_search_apparel_size_does_not_exclude_shoes():
+    # Regression: an apparel-size request ("Medium") must not wipe out shoes,
+    # which use a numeric system ("US 8"). The two systems aren't comparable.
+    boots = search_listings("boots", size="Medium", max_price=200)
+    assert any("boots" in r["title"].lower() for r in boots), (
+        "apparel-size request excluded numeric-sized shoes"
     )
 
 
