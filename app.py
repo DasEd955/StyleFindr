@@ -1,13 +1,14 @@
 """
 app.py - Gradio interface for the FitFindr styling pipeline.
 
-The UI is built intentionally thin. All search, outfit generation, and fit card logic
-lives in agent.run_agent() and the three tools in tools.py; this module only
-renders the results across three output panels. handle_query() is the single
-Gradio callback; it guards against empty input, selects the wardrobe, delegates
-to run_agent(), and maps the session dict to (listing_text, outfit_text, fit_card_text).
+The UI is built intentionally thin. All search, price-check, outfit generation,
+and fit card logic lives in agent.run_agent() and the four tools in tools.py;
+this module only renders the results across three output panels. handle_query()
+is the single Gradio callback; it guards against empty input, selects the
+wardrobe, delegates to run_agent(), and maps the session dict to (listing_text,
+outfit_text, fit_card_text). The price verdict is folded into listing_text.
 
-The three private _format_* helpers convert raw dicts from the session into
+The four private _format_* helpers convert raw dicts from the session into
 human-readable strings for the Textbox panels. A per-session wardrobe is
 chosen at submit time via a radio button (example vs. empty), so `new-user` and
 `existing-wardrobe` flows are exercised through the same code path.
@@ -64,9 +65,15 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     if session["error"]:
         return session["error"], "", ""
 
-    # 5. Map the session dict to the three panel strings.
+    # 5. Map the session dict to the three panel strings. The price verdict is
+    #    folded into the listing panel since it qualifies the item's price.
+    listing_text = _format_listing(session["selected_item"])
+    price_text = _format_price(session["price_check"])
+    if price_text:
+        listing_text = f"{listing_text}\n\n{price_text}"
+
     return (
-        _format_listing(session["selected_item"]),
+        listing_text,
         _format_outfit(session["outfit_suggestion"]),
         _format_fit_card(session["fit_card"]),
     )
@@ -98,6 +105,40 @@ def _format_listing(item: dict) -> str:
     if tags:
         lines.append(f"Style: {tags}")
     return "\n".join(lines)
+
+
+# Verdict → short labelled headline for the price panel. Keys mirror the
+# price_compare() verdict strings exactly; an unknown verdict yields no label.
+_PRICE_LABELS = {
+    "underpriced": "💰 Great Price",
+    "fair": "✅ Fairly Priced",
+    "overpriced": "⚠️ Priced High",
+    "insufficient_data": "🤷 Not Enough Comparables",
+}
+
+
+def _format_price(price_check: dict | None) -> str:
+    """
+    Render a price_compare result dict into a labelled line for the listing panel.
+
+    price_check is None when the price step failed (partial success): the rest of
+    the listing panel is still shown, and this helper contributes nothing rather
+    than crashing. The verdict maps to a short headline via _PRICE_LABELS, followed
+    by price_compare's own one-sentence explanation.
+
+    Args:
+        price_check (dict | None): The dict from session["price_check"], or None on
+            partial success. Expected keys: verdict, explanation.
+
+    Returns:
+        str: A two-line "label\\nexplanation" block, or an empty string when
+            price_check is None.
+    """
+    if not price_check:
+        return ""
+    label = _PRICE_LABELS.get(price_check.get("verdict"), "")
+    explanation = price_check.get("explanation", "")
+    return f"{label}\n{explanation}".strip()
 
 
 def _format_outfit(outfit: dict) -> str:

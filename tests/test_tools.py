@@ -1,15 +1,15 @@
 """
-test_tools.py - Isolation tests for the three FitFindr tools.
+test_tools.py - Isolation tests for the four FitFindr tools.
 
-search_listings() is pure (no network) and is tested directly against the real
-dataset. suggest_outfit() and create_fit_card() call the Groq LLM, so tests
-monkeypatch tools._chat with a canned-JSON recorder. This keeps the suite fast,
-deterministic, and runnable without a GROQ_API_KEY.
+search_listings() and price_compare() are pure (no network) and are tested
+directly against the real dataset. suggest_outfit() and create_fit_card() call
+the Groq LLM, so tests monkeypatch tools._chat with a canned-JSON recorder. This
+keeps the suite fast, deterministic, and runnable without a GROQ_API_KEY.
 
 Coverage includes at least one test per documented failure mode: empty search
 results, empty wardrobe, apparel-size cross-system pass-through, whole-word
-keyword matching, incomplete outfit input, None outfit, and malformed JSON from
-the model.
+keyword matching, incomplete outfit input, None outfit, malformed JSON from the
+model, and price_compare's insufficient-data / verdict-band paths.
 
 Run from the project root:
 
@@ -19,7 +19,7 @@ Run from the project root:
 import json
 import pytest
 import tools
-from tools import create_fit_card, search_listings, suggest_outfit
+from tools import create_fit_card, price_compare, search_listings, suggest_outfit
 
 # A minimal listing used as `new_item` in the LLM-tool tests.
 SAMPLE_ITEM = {
@@ -210,3 +210,74 @@ def test_fit_card_malformed_json(monkeypatch):
     card = create_fit_card({"outfit_description": "x"}, SAMPLE_ITEM)
     assert card["fit_card_text"] == "<<garbage>>"
     assert card["style_tags"] == []
+
+
+# ── price_compare (Pure, No Mocking) ─────────────────────────────────────────
+
+def test_price_compare_returns_contract_dict():
+    """Verify price_compare returns a dict with every contract key for a real dataset item."""
+    item = search_listings("vintage graphic tee", size=None, max_price=200)[0]
+    result = price_compare(item)
+    assert set(result.keys()) == {
+        "verdict",
+        "item_price",
+        "comparable_count",
+        "comparable_avg",
+        "comparable_median",
+        "comparable_range",
+        "explanation",
+    }
+    assert result["verdict"] in {"underpriced", "fair", "overpriced", "insufficient_data"}
+
+
+def test_price_compare_missing_price():
+    """Verify a non-numeric price yields an insufficient_data verdict rather than raising."""
+    result = price_compare({"id": "x", "category": "tops", "price": None, "style_tags": []})
+    assert result["verdict"] == "insufficient_data"
+    assert result["item_price"] is None
+    assert result["comparable_avg"] is None
+
+
+def test_price_compare_unknown_category_insufficient_data():
+    """Verify an item in a category with no peers reports insufficient_data, not a crash."""
+    result = price_compare(
+        {"id": "x", "category": "nonexistent-category", "price": 50.0, "style_tags": []}
+    )
+    assert result["verdict"] == "insufficient_data"
+    assert result["comparable_count"] == 0
+
+
+def test_price_compare_overpriced_verdict():
+    """Verify an item priced far above its category comparables is flagged overpriced.
+
+    Uses a real "tops" item id (so it is excluded from its own comparables) but an
+    inflated price, which must land above the 1.15x median band.
+    """
+    base = search_listings("tee", size=None, max_price=200)[0]
+    inflated = {**base, "price": 999.0}
+    result = price_compare(inflated)
+    assert result["verdict"] == "overpriced"
+    assert result["comparable_count"] >= 2
+    assert result["item_price"] == 999.0
+
+
+def test_price_compare_underpriced_verdict():
+    """Verify an item priced far below its category comparables is flagged underpriced."""
+    base = search_listings("tee", size=None, max_price=200)[0]
+    cheap = {**base, "price": 1.0}
+    result = price_compare(cheap)
+    assert result["verdict"] == "underpriced"
+    assert result["comparable_count"] >= 2
+
+
+def test_price_compare_excludes_self():
+    """Verify the item being priced is never counted among its own comparables (excluded by id)."""
+    listings = tools.load_listings()
+    # Pick a category with several members so a comparable set exists.
+    item = next(l for l in listings if l.get("category") == "tops")
+    result = price_compare(item)
+    category_peers = sum(
+        1 for l in listings if l.get("category") == "tops" and l.get("id") != item["id"]
+    )
+    # comparable_count can be <= peers (tag filtering narrows it) but never counts self.
+    assert result["comparable_count"] <= category_peers

@@ -1,12 +1,12 @@
 """
 agent.py - The FitFindr planning loop.
 
-Orchestrates the three tools (search_listings, suggest_outfit, create_fit_card)
-in response to a natural language user query, passing state between them through
-a single session dict. The loop has two conditional branches: empty search
-results terminate early with an error, while suggest_outfit failure also
-terminates early; create_fit_card failure is treated as a partial success and
-does not set the error field.
+Orchestrates the four tools (search_listings, price_compare, suggest_outfit,
+create_fit_card) in response to a natural language user query, passing state
+between them through a single session dict. The loop has two conditional
+branches: empty search results terminate early with an error, while
+suggest_outfit failure also terminates early; price_compare and create_fit_card
+failures are treated as partial successes and do not set the error field.
 
 Query parsing uses regex rather than an LLM call; the fields needed (a price
 number, a size token, leftover keywords) are cheap and deterministic to extract
@@ -25,7 +25,7 @@ Usage:
 """
 
 import re
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, price_compare, suggest_outfit, create_fit_card
 
 
 # ── Query Parsing ─────────────────────────────────────────────────────────────
@@ -109,14 +109,16 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         wardrobe (dict): The user's wardrobe dict, passed through to suggest_outfit().
 
     Returns:
-        dict: A zeroed-out session with keys: query, parsed, search_results,
-            selected_item, wardrobe, outfit_suggestion, fit_card, error.
+        dict: A zeroed out session with keys: query, parsed, search_results,
+            selected_item, price_check, wardrobe, outfit_suggestion, fit_card,
+            error.
     """
     return {
         "query": query,              # Original user query
         "parsed": {},                # Extracted description / size / max_price
         "search_results": [],        # List of matching listing dicts
         "selected_item": None,       # Top result, passed into suggest_outfit
+        "price_check": None,         # Dict from price_compare (None = unavailable)
         "wardrobe": wardrobe,        # User's wardrobe dict
         "outfit_suggestion": None,   # String returned by suggest_outfit
         "fit_card": None,            # String returned by create_fit_card
@@ -130,12 +132,14 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     Run the FitFindr planning loop for a single user interaction.
 
-    Parses the query, searches listings, selects the top result, generates an
-    outfit suggestion, and produces a fit card; each step stored in the session
-    dict. Two branches terminate early: empty search results set session["error"]
-    and return before suggest_outfit is called; a suggest_outfit failure also sets
-    the error and stops the loop. A create_fit_card failure is partial-success
-    only; session["fit_card"] is left as None but session["error"] stays None.
+    Parses the query, searches listings, selects the top result, assesses whether
+    its price is fair, generates an outfit suggestion, and produces a fit card;
+    each step stored in the session dict. Two branches terminate early: empty
+    search results set session["error"] and return before suggest_outfit is
+    called; a suggest_outfit failure also sets the error and stops the loop. A
+    price_compare or create_fit_card failure is partial-success only;
+    session["price_check"] / session["fit_card"] is left as None but
+    session["error"] stays None.
 
     Args:
         query (str): Natural language user request
@@ -190,7 +194,16 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     # Step 4 — select the top-ranked listing as the item to style.
     session["selected_item"] = results[0]
 
-    # Step 5 — suggest an outfit. An empty wardrobe is handled inside the tool
+    # Step 5 — assess whether the selected item's price is fair against
+    # comparable listings. This is partial-failure tolerant: a price verdict is
+    # a nice to have, not core, so any unexpected error leaves price_check as
+    # None (a degraded success) rather than stopping the loop.
+    try:
+        session["price_check"] = price_compare(session["selected_item"])
+    except Exception:
+        session["price_check"] = None
+
+    # Step 6 — suggest an outfit. An empty wardrobe is handled inside the tool
     # (generic wardrobe staples fallback) and is NOT an error, so the loop continues.
     # A genuine LLM/API failure raises; we catch it, set the error, and stop
     # create_fit_card is never called with empty input.
@@ -206,7 +219,7 @@ def run_agent(query: str, wardrobe: dict) -> dict:
 
     session["outfit_suggestion"] = outfit
 
-    # Step 6 — create the fit card. This is partial-failure tolerant: if the
+    # Step 7 — create the fit card. This is partial-failure tolerant: if the
     # LLM call fails, we keep the outfit suggestion and simply leave fit_card
     # as None (a degraded success), rather than erroring out the whole run.
     try:
@@ -214,7 +227,7 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     except Exception:
         session["fit_card"] = None
 
-    # Step 7 — return the completed session.
+    # Step 8 — return the completed session.
     return session
 
 
@@ -232,6 +245,7 @@ if __name__ == "__main__":
         print(f"Error: {session['error']}")
     else:
         print(f"Found: {session['selected_item']['title']}")
+        print(f"\nPrice check: {session['price_check']}")
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
 

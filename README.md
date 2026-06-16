@@ -1,6 +1,6 @@
 # StyleFindr — FitFindr Agent
 
-A multi-tool AI agent that helps users find secondhand clothing listings, suggests outfits intelligently using the user's wardrobe, and generates shareable fit captions for social media; all from a single natural-language processing query.
+A multi-tool AI agent that helps users find secondhand clothing listings, suggests outfits intelligently using the user's wardrobe, generates shareable fit captions for social media, and gauges whether a listing's price is fair against comparable items; all from a single natural-language processing query.
 
 ---
 
@@ -49,6 +49,19 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 
 ---
 
+### Tool 4: `price_compare`
+
+**File:** [tools.py:692](tools.py#L692)
+
+| | |
+|---|---|
+| **Input: `item`** | `dict` — Listing dict from `search_listings` (uses `id`, `price`, `category`, `style_tags`). |
+| **Output** | `dict` with keys: `verdict` (str — `"underpriced"`, `"fair"`, `"overpriced"`, or `"insufficient_data"`), `item_price` (float \| None), `comparable_count` (int), `comparable_avg` (float \| None), `comparable_median` (float \| None), `comparable_range` (list[float] \| None), `explanation` (str). |
+
+**Purpose:** Estimates whether an item's asking price is fair by comparing it against comparable listings in the dataset. Pure & deterministic (no LLM call), like `search_listings`. Comparables are peers in the same `category` that share at least one `style_tag` (falling back to all same-category listings when too few share tags); the item itself is excluded by `id`. The verdict is the item's price ratioed against the comparable **median**: `≤ 0.85` → underpriced, `0.85–1.15` → fair, `≥ 1.15` → overpriced. Thin data (fewer than 2 comparables) or a missing/non-numeric price returns `"insufficient_data"` rather than raising.
+
+---
+
 ## Planning Loop
 
 **File:** [agent.py:110](agent.py#L110)
@@ -64,22 +77,27 @@ Step 2 — search_listings(description, size, max_price)
          → Empty list?  Set session["error"], STOP (no results message)
          → Results?     session["selected_item"] = results[0], continue
 
-Step 3 — suggest_outfit(selected_item, wardrobe)
+Step 3 — price_compare(selected_item)
+         → Error?       session["price_check"] = None, continue (partial success)
+         → Otherwise?   session["price_check"] = verdict dict, continue
+                        (an "insufficient_data" verdict is still a normal result)
+
+Step 4 — suggest_outfit(selected_item, wardrobe)
          → LLM failure? Set session["error"], STOP (outfit error message)
          → Empty outfit? Set session["error"], STOP
          → Empty wardrobe? Fallback to staples, continue (NOT an error)
          → Success?     session["outfit_suggestion"] = outfit, continue
 
-Step 4 — create_fit_card(outfit_suggestion, selected_item)
+Step 5 — create_fit_card(outfit_suggestion, selected_item)
          → LLM failure? session["fit_card"] = None, continue (partial success)
          → Success?     session["fit_card"] = fit_card, continue
 
-Step 5 — Return completed session dict
+Step 6 — Return completed session dict
 ```
 
 **Query Parsing Choice:** Step 1 uses regex (`_parse_query()` in [agent.py:38](agent.py#L38)), not an LLM call. Price numbers (`under $30`, `$30`), size tokens (`size M`, standalone `XS`/`S`/`M`/`L`/`XL`), and leftover keywords are cheap and deterministic to extract with patterns. Skipping an LLM hop here reduces latency and removes a failure surface before any tool runs.
 
-**Key Behavioral Rule:** An empty `search_listings` result stops the loop entirely. An empty wardrobe in `suggest_outfit` triggers a fallback path but does NOT stop the loop. A failed `create_fit_card` degrades gracefully & the outfit is still shown.
+**Key Behavioral Rule:** An empty `search_listings` result stops the loop entirely. An empty wardrobe in `suggest_outfit` triggers a fallback path but does NOT stop the loop. A failed `price_compare` or `create_fit_card` degrades gracefully & the rest of the result is still shown.
 
 ---
 
@@ -95,6 +113,7 @@ session = {
     "parsed":            dict,         # {description, size, max_price} from _parse_query
     "search_results":    list[dict],   # Full list from search_listings
     "selected_item":     dict | None,  # search_results[0] — top-ranked listing
+    "price_check":       dict | None,  # Full dict from price_compare (None = partial success)
     "wardrobe":          dict,         # Loaded once, passed directly to suggest_outfit
     "outfit_suggestion": dict | None,  # Full dict from suggest_outfit
     "fit_card":          dict | None,  # Full dict from create_fit_card (None = partial success)
@@ -102,7 +121,7 @@ session = {
 }
 ```
 
-**Data flow:** `selected_item` passes directly from `search_listings` into `suggest_outfit` without user re-entry. Both `outfit_suggestion` and `selected_item` pass directly into `create_fit_card`. The Gradio UI ([app.py:23](app.py#L23)) reads `session["selected_item"]`, `session["outfit_suggestion"]`, and `session["fit_card"]` to populate the three output panels in the application.
+**Data flow:** `selected_item` passes directly from `search_listings` into `price_compare`, `suggest_outfit`, and `create_fit_card` without user re-entry. Both `outfit_suggestion` and `selected_item` pass directly into `create_fit_card`. The Gradio UI ([app.py:23](app.py#L23)) reads `session["selected_item"]`, `session["price_check"]`, `session["outfit_suggestion"]`, and `session["fit_card"]` to populate the output panels; the price verdict is folded into the listing panel.
 
 ---
 
@@ -112,6 +131,8 @@ session = {
 |------|-------------|----------------|
 | `search_listings` | Returns `[]` | Sets `session["error"]`: *"No listings matched '[desc]' in size [size] under [price]. Try a broader description, a higher budget, or a different size."* Loop stops. |
 | `search_listings` | Unexpected exception (e.g., missing data file) | Sets `session["error"]`: *"Search failed due to an unexpected error. Please try again."* Loop stops. |
+| `price_compare` | Fewer than 2 comparables, or item has no usable price | Returns `verdict = "insufficient_data"`; the listing panel simply omits the price verdict. Loop **continues** (not an error). |
+| `price_compare` | Unexpected exception | `session["price_check"]` is set to `None`. Listing is still shown without a verdict. Loop **continues** (partial success). |
 | `suggest_outfit` | Empty wardrobe | LLM is prompted for generic staples; `matching_items` holds those staples; `outfit_description` flags them as suggestions. Loop **continues** (this is not an error). |
 | `suggest_outfit` | LLM/API failure | Sets `session["error"]`: *"Outfit generation failed. Please try again."* Loop stops. `create_fit_card` is never called with empty input. |
 | `suggest_outfit` | Malformed JSON from LLM | Wraps raw text as `outfit_description`; other fields default to empty. Caller receives the contract shape instead of a crash. |
@@ -135,7 +156,7 @@ session = {
 
 **What Matched the Plan:**
 
-The implementation follows the planning.md spec closely. The three tools cover exactly the planned inputs and outputs. The sequential conditional loop in `run_agent()` matches the pseudocode step-for-step: empty search results stop the loop, empty wardrobe triggers a fallback but continues, and a failed fit card is treated as a partial success rather than an error. The session dict field names and data flow arrows in the Mermaid diagram map directly to the code.
+The implementation follows the planning.md spec closely. The four tools cover exactly the planned inputs and outputs. The sequential conditional loop in `run_agent()` matches the pseudocode step-for-step: empty search results stop the loop, empty wardrobe triggers a fallback but continues, and a failed fit card is treated as a partial success rather than an error. The session dict field names and data flow arrows in the Mermaid diagram map directly to the code.
 
 **What changed during implementation:**
 

@@ -86,6 +86,39 @@ A dictionary containing:
 
 ---
 
+### Tool 4: price_compare
+
+**What it does:**
+Given a selected item, estimates whether its asking price is fair by comparing it against comparable listings already in the mock dataset. Pure & deterministic (no LLM call), like `search_listings`: it finds peers in the same category that share style tags, then judges the item's price against the median of those peers.
+
+**Input parameters:**
+- `item` (dict): A listing dict (the item being evaluated, e.g. `search_results[0]`). Uses `id`, `price`, `category`, and `style_tags`.
+
+**What it returns:**
+A dictionary containing:
+- `verdict` (str): One of `"underpriced"`, `"fair"`, `"overpriced"`, or `"insufficient_data"`.
+- `item_price` (float): The item's own asking price (echoed back for display).
+- `comparable_count` (int): Number of comparable listings found in the dataset.
+- `comparable_avg` (float | None): Mean price of the comparables, or `None` when there are too few.
+- `comparable_median` (float | None): Median price of the comparables, or `None` when there are too few.
+- `comparable_range` (list[float] | None): `[min, max]` price across the comparables, or `None`.
+- `explanation` (str): One sentence plain language summary of the verdict.
+
+**Comparable selection:**
+A listing is defined as comparable when it is in the same `category` AND shares at least one `style_tag` with the item. If fewer than `_MIN_COMPARABLES` (2) such peers exist, it falls back to all same-category listings so a verdict can still be formed. The item itself is always excluded by `id`.
+
+**Fairness bands (heuristic):** Let `ratio = item_price / median(comparables)`.
+- `ratio <= 0.85` → `"underpriced"` (a good deal)
+- `0.85 < ratio < 1.15` → `"fair"`
+- `ratio >= 1.15` → `"overpriced"`
+
+**What happens if it fails or returns nothing:**
+- If fewer than 2 comparables exist even after the category fallback, returns `verdict = "insufficient_data"` with `comparable_avg`/`comparable_median`/`comparable_range` set to `None`. It never raises on thin data.
+- If the item has no usable `price` (missing or non-numeric), returns `"insufficient_data"`.
+- Like `search_listings`, a dataset load failure propagates so the agent layer can report "comparison failed" distinct from "not enough comparables".
+
+---
+
 ## Planning Loop
 
 The agent uses a sequential conditional loop. It does NOT call all tools in a fixed order regardless of results. Each step checks the previous output before proceeding.
@@ -102,10 +135,16 @@ The agent uses a sequential conditional loop. It does NOT call all tools in a fi
        Set session.selected_item = results[0]
        Continue to step 3.
 
-3. Load wardrobe via get_example_wardrobe() (or get_empty_wardrobe() in testing)
+3. Call price_compare(session.selected_item)
+   → On any unexpected error:
+       Set session.price_check = None (partial success — do NOT stop).
+   → Otherwise:
+       Set session.price_check = result (verdict + comparables). Continue.
+
+4. Load wardrobe via get_example_wardrobe() (or get_empty_wardrobe() in testing)
    Store in session: { wardrobe }
 
-4. Call suggest_outfit(session.selected_item, session.wardrobe)
+5. Call suggest_outfit(session.selected_item, session.wardrobe)
    → If LLM call fails or returns None:
        Set session.error_message = "Outfit generation failed."
        Return error to user. STOP.
@@ -113,25 +152,26 @@ The agent uses a sequential conditional loop. It does NOT call all tools in a fi
        Result uses fallback staples. Store result, continue.
    → If result contains outfit_description:
        Set session.selected_outfit = result
-       Continue to step 5.
+       Continue to step 6.
 
-5. Call create_fit_card(session.selected_outfit, session.selected_item)
+6. Call create_fit_card(session.selected_outfit, session.selected_item)
    → If LLM call fails:
        Display session.selected_outfit to user without fit card.
        Note: "Fit card generation failed."
        STOP (partial success, not a crash).
    → If fit_card_text is returned:
        Set session.fit_card = result
-       Continue to step 6.
+       Continue to step 7.
 
-6. Display final output to user:
+7. Display final output to user:
    - Best match: session.selected_item (title, price, platform, condition)
+   - Price check: session.price_check (verdict + explanation), if available
    - Outfit suggestion: session.selected_outfit.outfit_description
    - Fit card: session.fit_card.fit_card_text + style_tags
    END SESSION.
 ```
 
-**The key behavioral rule:** The agent changes behavior based on what each tool returns. An empty list from `search_listings` stops the loop entirely. An empty wardrobe triggers a fallback path — but does not stop the loop. A failed fit card degrades gracefully without hiding the outfit result.
+**The key behavioral rule:** The agent changes behavior based on what each tool returns. An empty list from `search_listings` stops the loop entirely. An empty wardrobe triggers a fallback path, but does not stop the loop. A failed price check or fit card degrades gracefully without hiding the rest of the result.
 
 **Query parsing (Step 1 choice):** Parsing the natural-language query into `description` / `size` / `max_price` is done with **regex/string parsing**, not an LLM call. The three fields are cheap and deterministic to extract — a price number (`under $30` or a bare `$30`), a size token (`size M` or a standalone `XS`/`S`/`M`/`L`/`XL`/`XXS`/`XXL`), and the leftover keywords as the description. Avoiding an LLM hop here keeps Step 1 fast and removes a failure surface before any tool runs. (Implemented as `_parse_query()` in `agent.py`.)
 
@@ -148,12 +188,13 @@ Tracked state:
 - `max_price` (float): Extracted maximum price
 - `search_results` (list[dict]): Full list returned by `search_listings()`
 - `selected_item` (dict): `search_results[0]` — the top-ranked listing
+- `price_check` (dict | None): Full dict returned by `price_compare()`; `None` on partial failure
 - `wardrobe` (dict): Loaded once via `get_example_wardrobe()` or `get_empty_wardrobe()`
 - `selected_outfit` (dict): Full dict returned by `suggest_outfit()`
 - `fit_card` (dict): Full dict returned by `create_fit_card()`
 - `error_message` (str | None): Set when any tool fails; controls early termination
 
-Data flow: `selected_item` is passed directly into `suggest_outfit` without user re-entry. `selected_outfit` and `selected_item` are both passed into `create_fit_card`. The user never needs to repeat information between steps.
+Data flow: `selected_item` is passed directly into `price_compare`, `suggest_outfit`, and `create_fit_card` without user re-entry. `selected_outfit` and `selected_item` are both passed into `create_fit_card`. The user never needs to repeat information between steps.
 
 ---
 
@@ -163,6 +204,8 @@ Data flow: `selected_item` is passed directly into `suggest_outfit` without user
 |------|-------------|----------------|
 | `search_listings` | Returns empty list | Tell user: "No matches for [query] in size [size] under $[price]. Try broadening your description or raising your budget." Stop workflow. |
 | `search_listings` | Unexpected exception | Log error, tell user: "Search failed due to an unexpected error. Please try again." Stop workflow. |
+| `price_compare` | Fewer than 2 comparables, or item has no usable price | Returns `verdict = "insufficient_data"`; the UI simply omits the price verdict. Loop **continues** (not an error). |
+| `price_compare` | Unexpected exception | Set `session.price_check = None`. Loop continues (partial success); the listing is still shown without a price verdict. |
 | `suggest_outfit` | Wardrobe is empty | Use generic staple pieces as fallback. Notify user that personalized matching was unavailable. Continue to `create_fit_card`. |
 | `suggest_outfit` | LLM call fails or returns None | Tell user: "Outfit generation failed. Please try again." Stop workflow. Do not call `create_fit_card` with empty input. |
 | `create_fit_card` | Outfit dict missing `outfit_description` | Generate simplified caption from `new_item` fields only. |
@@ -182,7 +225,13 @@ flowchart TD
     E --> Z[End Session — no results]
 
     D -->|No| F[State: selected_item = results 0]
-    F --> G[Load wardrobe\nget_example_wardrobe or get_empty_wardrobe]
+
+    F --> PC[price_compare\nselected_item]
+    PC --> PD{comparables &ge; 2\nand price usable?}
+    PD -->|No| PE[price_check = insufficient_data / None\npartial success — continue]
+    PD -->|Yes| PF[State: price_check = verdict + comparables]
+    PE --> G[Load wardrobe\nget_example_wardrobe or get_empty_wardrobe]
+    PF --> G
 
     G --> H[suggest_outfit\nselected_item + wardrobe]
 
@@ -203,15 +252,16 @@ flowchart TD
     P -->|Yes| Q[Display outfit only\nno fit card — partial success]
     P -->|No| R[State: fit_card = result]
 
-    R --> S[Display: selected_item\n+ outfit_description\n+ fit_card_text + style_tags]
+    R --> S[Display: selected_item + price_check\n+ outfit_description\n+ fit_card_text + style_tags]
     Q --> S
 
     S --> Z3[End Session — success]
 
-    ST[(Session State\nuser_query, description, size,\nmax_price, search_results,\nselected_item, wardrobe,\nselected_outfit, fit_card,\nerror_message)]
+    ST[(Session State\nuser_query, description, size,\nmax_price, search_results,\nselected_item, price_check, wardrobe,\nselected_outfit, fit_card,\nerror_message)]
 
     B <--> ST
     F --> ST
+    PF --> ST
     N --> ST
     R --> ST
 ```
@@ -341,23 +391,29 @@ If `search_listings` returns `[]`:
 - Missing or empty `outfit_description` routes to a simplified item-only prompt (no crash, no None return).
 - `style_tags` is capped at 4 items by `_normalize_fit_card()`.
 
+**`price_compare` (tools.py)**
+- Implemented as planned: pure and deterministic, no LLM call. Mirrors `search_listings` in style.
+- Comparables are selected by `_find_comparables()` — same category plus shared style tag, with a same-category fallback when too few peers exist. The item itself is excluded by `id`.
+- The verdict is computed from the median of comparables via `_price_verdict()` with the `0.85` / `1.15` ratio bands. Thin data (< 2 comparables) or a missing/non-numeric price returns `"insufficient_data"` rather than raising.
+
 **Planning loop (agent.py:110)**
 - `_parse_query()` (regex) extracts `description`, `size`, `max_price` — no LLM call at parse time.
+- `price_compare` runs right after the top listing is selected; its result is stored in `session["price_check"]`. An unexpected error leaves `price_check = None` (partial success), so the price step never stops the loop.
 - `create_fit_card` failure is a partial success: `session["fit_card"] = None`, session still returned.
 - Session dict uses `"error"` key (not `"error_message"` as originally specified; simplified for consistency).
 
 **Gradio UI (app.py)**
-- `handle_query()` maps the session dict to three output panels via `_format_listing()`, `_format_outfit()`, `_format_fit_card()`.
-- `_format_fit_card(None)` returns a graceful degraded message rather than crashing.
+- `handle_query()` maps the session dict to three output panels via `_format_listing()`, `_format_outfit()`, `_format_fit_card()`. The price verdict is folded into the listing panel by `_format_price()`.
+- `_format_fit_card(None)` returns a graceful degraded message; `_format_price(None)` contributes an empty string so a missing price verdict simply drops out of the listing panel rather than crashing.
 
 ### Files
 
 | File | Role |
 |------|------|
-| [tools.py](tools.py) | All three tools + LLM helpers |
+| [tools.py](tools.py) | All four tools + LLM helpers |
 | [agent.py](agent.py) | Planning loop, query parser, session state |
 | [app.py](app.py) | Gradio UI, query handler, output formatters |
-| [tests/test_tools.py](tests/test_tools.py) | 11 pytest tests covering all tools and failure modes |
+| [tests/test_tools.py](tests/test_tools.py) | 31 pytest tests covering all tools and failure modes |
 | [utils/data_loader.py](utils/data_loader.py) | Dataset + wardrobe loaders |
 | [data/listings.json](data/listings.json) | 40 mock secondhand listings |
 | [data/wardrobe_schema.json](data/wardrobe_schema.json) | Wardrobe format + example wardrobe |

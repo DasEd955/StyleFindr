@@ -1,25 +1,29 @@
 """
-tools.py - The three core FitFindr tools and their private helpers.
+tools.py - The four core FitFindr tools and their private helpers.
 
 Each public tool is a standalone function that can be called and tested
 independently before being wired into the agent loop in agent.py.
 
-search_listings() is pure (no network): it loads the dataset, applies hard
-price/size filters, then ranks by keyword-overlap score. suggest_outfit() and
-create_fit_card() call the Groq LLM via the thin _chat() wrapper; both return
-validated contract dicts and handle malformed JSON defensively rather than
-raising. Private helpers (_tokens, _size_matches, _relevance_score, etc.) are
-module-internal and not part of the public API.
+search_listings() and price_compare() are pure (no network): they load the
+dataset and reason over it deterministically — search_listings ranks by
+keyword-overlap score, price_compare judges an item's price against comparable
+listings. suggest_outfit() and create_fit_card() call the Groq LLM via the thin
+_chat() wrapper; both return validated contract dicts and handle malformed JSON
+defensively rather than raising. Private helpers (_tokens, _size_matches,
+_relevance_score, _find_comparables, etc.) are module-internal and not part of
+the public API.
 
 Tools:
     search_listings(description, size, max_price)   → list[dict]
     suggest_outfit(new_item, wardrobe)              → dict
     create_fit_card(outfit, new_item)               → dict
+    price_compare(item)                             → dict
 """
 
 import json
 import os
 import re
+import statistics
 from dotenv import load_dotenv
 from groq import Groq
 from utils.data_loader import load_listings
@@ -601,3 +605,186 @@ def create_fit_card(outfit: dict, new_item: dict) -> dict:
         }
 
     return _normalize_fit_card(parsed)
+
+
+# ── Tool 4 Helpers ────────────────────────────────────────────────────────────
+
+# Fewer than this many comparables is too thin a sample to call a price fair or
+# not, so price_compare() returns an "insufficient_data" verdict instead.
+_MIN_COMPARABLES = 2
+
+# Fairness bands on the ratio of the item's price to the comparable median.
+# A price within ±15% of the median is "fair"; outside that it reads as a deal
+# or a markup. The asymmetry-free band heuristic keeps the verdict easy to explain.
+_UNDERPRICED_RATIO = 0.85
+_OVERPRICED_RATIO = 1.15
+
+
+def _find_comparables(item: dict, listings: list[dict]) -> list[dict]:
+    """
+    Select the listings that are comparable to a given item for pricing.
+
+    A peer is comparable when it is in the same category AND shares at least one
+    style tag with the item. That pairing keeps "a vintage denim jacket" from
+    being priced against an unrelated plain blazer in the same category. To avoid
+    a verdict built on too thin a sample, falls back to all same-category listings
+    when the tag overlap set has fewer than _MIN_COMPARABLES entries. The item
+    itself is always excluded by id so a listing never prices against itself.
+
+    Args:
+        item (dict): The listing being evaluated (uses id, category, style_tags).
+        listings (list[dict]): The full dataset to draw comparables from.
+
+    Returns:
+        list[dict]: Comparable listing dicts (may be empty when the category has
+            no other members).
+    """
+    item_id = item.get("id")
+    category = (item.get("category") or "").lower()
+    item_tags = _tokens(" ".join(item.get("style_tags", [])))
+
+    same_category = [
+        other
+        for other in listings
+        if other.get("id") != item_id
+        and (other.get("category") or "").lower() == category
+    ]
+
+    # Prefer peers that also share a style tag; fall back to the whole category
+    # when that narrower set is too small to judge against.
+    tag_overlap = [
+        other
+        for other in same_category
+        if _tokens(" ".join(other.get("style_tags", []))) & item_tags
+    ]
+    if len(tag_overlap) >= _MIN_COMPARABLES:
+        return tag_overlap
+    return same_category
+
+
+def _price_verdict(item_price: float, median_price: float) -> str:
+    """
+    Classify an item's price against the comparable median into a fairness band.
+
+    Compares the ratio item_price / median_price against the _UNDERPRICED_RATIO
+    and _OVERPRICED_RATIO thresholds. A median of zero (free comparables) cannot
+    yield a meaningful ratio, so it is reported as "insufficient_data".
+
+    Args:
+        item_price (float): The item's own asking price.
+        median_price (float): Median price of the comparable listings.
+
+    Returns:
+        str: One of "underpriced", "fair", "overpriced", or "insufficient_data".
+    """
+    if median_price <= 0:
+        return "insufficient_data"
+    ratio = item_price / median_price
+    if ratio <= _UNDERPRICED_RATIO:
+        return "underpriced"
+    if ratio >= _OVERPRICED_RATIO:
+        return "overpriced"
+    return "fair"
+
+
+# ── Tool 4: price_compare ─────────────────────────────────────────────────────
+
+def price_compare(item: dict) -> dict:
+    """
+    Estimate whether an item's asking price is fair against comparable listings.
+
+    Pure and deterministic (no LLM call), mirroring search_listings(): it loads
+    the dataset, gathers comparable listings via _find_comparables() (same
+    category + shared style tag, with a same-category fallback), then judges the
+    item's price against the median of those peers using the _UNDERPRICED_RATIO /
+    _OVERPRICED_RATIO bands. Thin data is a normal outcome: when fewer than
+    _MIN_COMPARABLES peers exist, or the item has no usable price, it returns a
+    "insufficient_data" verdict instead of raising.
+
+    Args:
+        item (dict): The listing being evaluated (uses id, price, category,
+            style_tags).
+
+    Returns:
+        dict: A verdict dict with keys:
+            verdict (str): "underpriced", "fair", "overpriced", or
+                "insufficient_data".
+            item_price (float | None): The item's asking price, echoed back.
+            comparable_count (int): Number of comparable listings found.
+            comparable_avg (float | None): Mean comparable price, or None when
+                the sample is too thin.
+            comparable_median (float | None): Median comparable price, or None.
+            comparable_range (list[float] | None): [min, max] comparable price,
+                or None.
+            explanation (str): One-sentence plain-language summary.
+    """
+    # Load the full dataset. A failure here (missing/corrupt data file) is a
+    # genuinely unexpected error; we let it propagate so the agent layer can
+    # report "comparison failed", distinct from the normal "not enough
+    # comparables" outcome below.
+    listings = load_listings()
+
+    price = item.get("price")
+    if not isinstance(price, (int, float)):
+        # No usable price → nothing to compare against.
+        return {
+            "verdict": "insufficient_data",
+            "item_price": None,
+            "comparable_count": 0,
+            "comparable_avg": None,
+            "comparable_median": None,
+            "comparable_range": None,
+            "explanation": "This item has no listed price, so its fairness can't be assessed.",
+        }
+    price = float(price)
+
+    comparables = _find_comparables(item, listings)
+    prices = [
+        float(c["price"])
+        for c in comparables
+        if isinstance(c.get("price"), (int, float))
+    ]
+
+    if len(prices) < _MIN_COMPARABLES:
+        return {
+            "verdict": "insufficient_data",
+            "item_price": price,
+            "comparable_count": len(prices),
+            "comparable_avg": None,
+            "comparable_median": None,
+            "comparable_range": None,
+            "explanation": (
+                f"Only {len(prices)} comparable listing(s) found — not enough to "
+                "judge whether this price is fair."
+            ),
+        }
+
+    avg_price = round(statistics.fmean(prices), 2)
+    median_price = round(statistics.median(prices), 2)
+    low, high = round(min(prices), 2), round(max(prices), 2)
+    verdict = _price_verdict(price, median_price)
+
+    explanations = {
+        "underpriced": (
+            f"At ${price:.0f}, this is a deal — comparable items typically go for "
+            f"around ${median_price:.0f} (${low:.0f}–${high:.0f})."
+        ),
+        "fair": (
+            f"At ${price:.0f}, this is priced fairly — comparable items typically "
+            f"go for around ${median_price:.0f} (${low:.0f}–${high:.0f})."
+        ),
+        "overpriced": (
+            f"At ${price:.0f}, this is on the high side — comparable items typically "
+            f"go for around ${median_price:.0f} (${low:.0f}–${high:.0f})."
+        ),
+    }
+
+    return {
+        "verdict": verdict,
+        "item_price": price,
+        "comparable_count": len(prices),
+        "comparable_avg": avg_price,
+        "comparable_median": median_price,
+        "comparable_range": [low, high],
+        "explanation": explanations[verdict],
+    }
