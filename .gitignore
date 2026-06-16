@@ -1,6 +1,9 @@
 # API keys — never commit these
 .env
 
+# Saved per-user style profiles (cross-session memory) — not fixtures
+style_profiles.json
+
 # Python
 __pycache__/
 *.py[cod]

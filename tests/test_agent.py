@@ -221,3 +221,115 @@ def test_handle_query_error_goes_to_first_panel():
     )
     assert "no listings matched" in listing.lower()
     assert outfit == "" and fit_card == ""
+
+
+# ── Retry With Fallback ──────────────────────────────────────────────────────
+
+def test_run_agent_records_fallback_adjustment(fake_llm):
+    """Verify run_agent loosens an over-restrictive size, still finds an item, and records the adjustment."""
+    # No tee is sized XS, so the size filter must be dropped to find one.
+    session = run_agent("vintage graphic tee size XS under $40", EXAMPLE_WARDROBE)
+    assert session["error"] is None
+    assert session["selected_item"] is not None
+    assert session["search_adjustments"] == ["removed the size XS filter"]
+
+
+def test_run_agent_no_adjustment_on_direct_match(fake_llm):
+    """Verify a query that matches directly leaves search_adjustments empty."""
+    session = run_agent("vintage graphic tee under $30", EXAMPLE_WARDROBE)
+    assert session["search_adjustments"] == []
+
+
+def test_handle_query_surfaces_fallback_note(fake_llm):
+    """Verify the Gradio handler prepends the fallback note to the listing panel when filters were loosened."""
+    listing, _, _ = app.handle_query(
+        "vintage graphic tee size XS under $40", "Example wardrobe"
+    )
+    assert "removed the size XS filter" in listing.lower()
+
+
+# ── Style Profile Memory ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def temp_profile(tmp_path, monkeypatch):
+    """
+    Redirect the style-profile store to a temp file for the duration of a test.
+
+    Monkeypatches tools._PROFILE_PATH so run_agent's load/update calls operate on
+    an isolated file under pytest's tmp_path, never touching a real
+    style_profiles.json in the project root.
+
+    Returns:
+        pathlib.Path: The temp profile-store path now in use.
+    """
+    path = tmp_path / "style_profiles.json"
+    monkeypatch.setattr(tools, "_PROFILE_PATH", str(path))
+    return path
+
+
+def test_run_agent_saves_then_applies_preferences(temp_profile, fake_llm):
+    """Verify run_agent persists size/budget and reapplies them to a later bare query.
+
+    First run explicitly requests size M under $30 with save_profile=True; the
+    second run searches with no size or budget but the saved profile must fill
+    them back in, recorded in session["profile_applied"].
+    """
+    first = run_agent(
+        "vintage graphic tee under $30 size M",
+        EXAMPLE_WARDROBE,
+        profile_id="default",
+        save_profile=True,
+    )
+    assert first["profile_saved"] is True
+
+    second = run_agent("vintage graphic tee", profile_id="default")
+    assert second["parsed"]["size"] == "M"
+    assert second["parsed"]["max_price"] == 30.0
+    assert "size M" in second["profile_applied"]
+    assert "budget $30" in second["profile_applied"]
+
+
+def test_run_agent_uses_saved_wardrobe_when_none_passed(temp_profile, fake_llm):
+    """Verify a returning user's saved wardrobe is reused when run_agent gets no wardrobe argument."""
+    run_agent(
+        "vintage graphic tee under $30",
+        EXAMPLE_WARDROBE,
+        profile_id="default",
+        save_profile=True,
+    )
+    # No wardrobe arg this time — it must come from the saved profile.
+    session = run_agent("vintage graphic tee", profile_id="default")
+    assert session["wardrobe"]["items"], "expected the saved wardrobe to be reused"
+    assert session["wardrobe"]["items"][0]["id"] == "w_001"
+
+
+def test_run_agent_query_overrides_saved_preference(temp_profile, fake_llm):
+    """Verify an explicit size in the query is not overwritten by the saved preference."""
+    run_agent(
+        "vintage graphic tee under $30 size M",
+        EXAMPLE_WARDROBE,
+        profile_id="default",
+        save_profile=True,
+    )
+    session = run_agent("vintage graphic tee size L", profile_id="default")
+    assert session["parsed"]["size"] == "L"       # query wins
+    assert session["profile_applied"] == []        # nothing needed filling in
+
+
+def test_run_agent_no_profile_id_skips_memory(temp_profile, fake_llm):
+    """Verify omitting profile_id leaves memory untouched (no apply, no save)."""
+    session = run_agent("vintage graphic tee under $30", EXAMPLE_WARDROBE)
+    assert session["profile_applied"] == []
+    assert session["profile_saved"] is False
+    # Nothing should have been written to the store.
+    assert not temp_profile.exists()
+
+
+def test_handle_query_saved_profile_choice_uses_memory(temp_profile, fake_llm):
+    """Verify the "Saved profile" wardrobe choice loads the wardrobe from memory in the Gradio handler."""
+    # Seed the profile via a remember-enabled run.
+    app.handle_query("vintage graphic tee under $30", "Example wardrobe", True)
+    # Now search using the saved profile; the saved-preference note should appear.
+    listing, outfit, _ = app.handle_query("vintage graphic tee", "Saved profile", False)
+    assert outfit  # a wardrobe was available, so an outfit was produced
+    assert "saved preferences" in listing.lower()

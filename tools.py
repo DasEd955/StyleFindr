@@ -13,11 +13,23 @@ defensively rather than raising. Private helpers (_tokens, _size_matches,
 _relevance_score, _find_comparables, etc.) are module-internal and not part of
 the public API.
 
+search_with_fallback() wraps search_listings(), retrying with progressively
+looser filters when nothing matches and reporting what it adjusted. The
+load_style_profile / save_style_profile / update_style_profile helpers persist a
+user's style preferences (size, budget, favorite styles, wardrobe) to a small
+JSON file so the agent can remember them across sessions.
+
 Tools:
-    search_listings(description, size, max_price)   → list[dict]
-    suggest_outfit(new_item, wardrobe)              → dict
-    create_fit_card(outfit, new_item)               → dict
-    price_compare(item)                             → dict
+    search_listings(description, size, max_price)      → list[dict]
+    search_with_fallback(description, size, max_price) → dict
+    suggest_outfit(new_item, wardrobe)                 → dict
+    create_fit_card(outfit, new_item)                  → dict
+    price_compare(item)                                → dict
+
+Style profile memory:
+    load_style_profile(profile_id)                  → dict
+    save_style_profile(profile, profile_id)         → dict
+    update_style_profile(size, max_price, styles, wardrobe, profile_id) → dict
 """
 
 import json
@@ -318,6 +330,89 @@ def search_listings(
     # 5. Sort by relevance (desc), tie-break by price (ascending). Return dicts only.
     scored.sort(key=lambda pair: (-pair[0], pair[1].get("price", 0.0)))
     return [item for _, item in scored]
+
+
+# ── Tool 1b: search_with_fallback ─────────────────────────────────────────────
+
+def search_with_fallback(
+    description: str,
+    size: str | None = None,
+    max_price: float | None = None,
+) -> dict:
+    """
+    Search listings, automatically loosening constraints when nothing matches.
+
+    Calls search_listings() with the full constraint set first. If that returns
+    no results, it retries with progressively looser filters: dropping the size
+    filter first, then the price ceiling, and stops at the first relaxation that
+    yields any results. Each relaxation is recorded in human-readable form so the
+    agent can tell the user exactly what was adjusted (e.g. "removed the size M
+    filter"). Size is relaxed before price because an exact size is usually less
+    central to intent than staying within budget; both are dropped if needed.
+
+    A genuinely empty result (nothing matches even with every filter removed) is
+    a normal outcome: the function returns an empty list rather than raising, with
+    `adjustments` listing every loosening that was attempted so the caller can
+    still explain what it tried.
+
+    Args:
+        description (str): Keywords describing the item (passed through unchanged).
+        size (str | None): Size token to filter by, or None to skip.
+        max_price (float | None): Maximum price inclusive, or None to skip.
+
+    Returns:
+        dict: A result dict with keys:
+            results (list[dict]): Matching listings (possibly empty), ranked as
+                search_listings() ranks them.
+            adjustments (list[str]): Human-readable descriptions of each filter
+                that was loosened to obtain `results`; empty when the first,
+                fully-constrained search already matched.
+            size (str | None): The size filter actually used for `results`
+                (None if it was dropped).
+            max_price (float | None): The price ceiling actually used for
+                `results` (None if it was dropped).
+    """
+    # First pass: honor every constraint the user gave.
+    results = search_listings(description, size, max_price)
+    if results:
+        return {"results": results, "adjustments": [], "size": size, "max_price": max_price}
+
+    adjustments = []
+    eff_size, eff_max_price = size, max_price
+
+    # Relaxation 1 → drop the size filter (usually the most restrictive).
+    if eff_size is not None:
+        adjustments.append(f"removed the size {eff_size} filter")
+        eff_size = None
+        results = search_listings(description, eff_size, eff_max_price)
+        if results:
+            return {
+                "results": results,
+                "adjustments": adjustments,
+                "size": eff_size,
+                "max_price": eff_max_price,
+            }
+
+    # Relaxation 2 → lift the price ceiling.
+    if eff_max_price is not None:
+        adjustments.append(f"lifted the ${eff_max_price:.0f} budget cap")
+        eff_max_price = None
+        results = search_listings(description, eff_size, eff_max_price)
+        if results:
+            return {
+                "results": results,
+                "adjustments": adjustments,
+                "size": eff_size,
+                "max_price": eff_max_price,
+            }
+
+    # Nothing matched even with every filter relaxed → a normal empty result.
+    return {
+        "results": results,
+        "adjustments": adjustments,
+        "size": eff_size,
+        "max_price": eff_max_price,
+    }
 
 
 # ── Tool 2 Helpers ────────────────────────────────────────────────────────────
@@ -788,3 +883,190 @@ def price_compare(item: dict) -> dict:
         "comparable_range": [low, high],
         "explanation": explanations[verdict],
     }
+
+
+# ── Style Profile Memory ──────────────────────────────────────────────────────
+
+# Where the cross-session style profile is persisted. It lives at the project
+# root (next to this file) and is git-ignored: it holds per-user preferences,
+# not fixtures, so it must never be committed alongside the mock data in data/.
+# Tests monkeypatch this constant to redirect writes to a temp file.
+_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "style_profiles.json")
+
+# Cap on remembered favorite style tags so the profile can't grow without bound
+# as the user runs more searches; the most recently seen tags win at the cap.
+_MAX_FAVORITE_STYLES = 12
+
+
+def _empty_profile() -> dict:
+    """
+    Return a fresh, empty style profile with every contract field present.
+
+    Used both as the value returned by load_style_profile() when no profile has
+    been saved yet and as the normalization fallback when a stored profile is
+    missing or malformed. Keeping the empty shape in one place means callers can
+    always rely on the four keys existing regardless of disk state.
+
+    Args:
+        None
+
+    Returns:
+        dict: A profile dict with keys — preferred_size (None), max_price (None),
+            favorite_styles (empty list), wardrobe (dict with empty items list).
+    """
+    return {
+        "preferred_size": None,
+        "max_price": None,
+        "favorite_styles": [],
+        "wardrobe": {"items": []},
+    }
+
+
+def _normalize_profile(parsed: dict) -> dict:
+    """
+    Coerce a raw profile dict (from disk or a caller) into the contract shape.
+
+    Guarantees the four profile fields exist with the correct types so the agent
+    never has to defend against a half-populated or hand edited profile file:
+    preferred_size becomes a str or None, max_price a float or None,
+    favorite_styles a capped list[str], and wardrobe a dict with an items list.
+    A non-dict input (e.g. a corrupt entry) degrades to a fresh empty profile.
+
+    Args:
+        parsed (dict): A dict read from the profile store, or any value to coerce.
+
+    Returns:
+        dict: A profile dict guaranteed to match the _empty_profile() shape.
+    """
+    if not isinstance(parsed, dict):
+        return _empty_profile()
+
+    styles = parsed.get("favorite_styles", [])
+    if not isinstance(styles, list):
+        styles = []
+
+    wardrobe = parsed.get("wardrobe")
+    if not isinstance(wardrobe, dict) or not isinstance(wardrobe.get("items"), list):
+        wardrobe = {"items": []}
+
+    size = parsed.get("preferred_size")
+    price = parsed.get("max_price")
+    return {
+        "preferred_size": str(size) if size else None,
+        "max_price": float(price) if isinstance(price, (int, float)) else None,
+        "favorite_styles": [str(s) for s in styles][-_MAX_FAVORITE_STYLES:],
+        "wardrobe": wardrobe,
+    }
+
+
+def _read_profile_store() -> dict:
+    """
+    Read the whole profile store (profile_id → profile) from disk.
+
+    The store is a single JSON object mapping profile ids to profile dicts. A
+    missing file (no profile saved yet) or a corrupt/unreadable one is treated as
+    an empty store rather than an error, so the memory feature degrades to "no
+    memory" instead of breaking the agent on a first run or a bad file.
+
+    Args:
+        None
+
+    Returns:
+        dict: The raw store mapping ids to profile dicts; empty dict when the
+            file is absent or cannot be parsed.
+    """
+    try:
+        with open(_PROFILE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def load_style_profile(profile_id: str = "default") -> dict:
+    """
+    Load a saved style profile so a returning user need not re-describe everything.
+
+    Reads the profile store from disk and returns the normalized profile for the
+    given id. When no profile has been saved under that id yet, returns a fresh
+    empty profile (never None and never raises), so the agent can treat first-time
+    and returning users through the same code path.
+
+    Args:
+        profile_id (str): Identifier for the profile to load. Defaults to
+            "default", the single-user profile used by the Gradio UI.
+
+    Returns:
+        dict: A profile dict with keys preferred_size (str | None), max_price
+            (float | None), favorite_styles (list[str]), and wardrobe (dict).
+    """
+    store = _read_profile_store()
+    return _normalize_profile(store.get(profile_id, {}))
+
+
+def save_style_profile(profile: dict, profile_id: str = "default") -> dict:
+    """
+    Persist a style profile to disk under the given id, preserving other profiles.
+
+    Normalizes the profile to the contract shape, merges it into the existing
+    store (so saving one profile id never clobbers another), and writes the whole
+    store back as indented JSON. Returns the normalized profile that was written
+    so callers can reuse it without re-reading the file.
+
+    Args:
+        profile (dict): The profile dict to save; normalized before writing.
+        profile_id (str): Identifier to store the profile under. Defaults to
+            "default".
+
+    Returns:
+        dict: The normalized profile dict as written to disk.
+    """
+    normalized = _normalize_profile(profile)
+    store = _read_profile_store()
+    store[profile_id] = normalized
+    with open(_PROFILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2)
+    return normalized
+
+
+def update_style_profile(
+    size: str | None = None,
+    max_price: float | None = None,
+    styles: list[str] | None = None,
+    wardrobe: dict | None = None,
+    profile_id: str = "default",
+) -> dict:
+    """
+    Merge newly observed preferences into the saved profile and persist it.
+
+    Called after a successful interaction to remember what the user searched for:
+    the size and budget they used, the style tags of the item they landed on, and
+    the wardrobe in play. Only arguments that are provided overwrite existing
+    values (a None/empty argument leaves that field untouched), so a single search
+    that omits a size does not erase a previously remembered one. New style tags
+    are appended without duplicates and capped at _MAX_FAVORITE_STYLES, newest kept.
+
+    Args:
+        size (str | None): Size to remember as preferred, or None to leave as-is.
+        max_price (float | None): Budget to remember, or None to leave as-is.
+        styles (list[str] | None): Style tags to fold into favorite_styles, or None.
+        wardrobe (dict | None): Wardrobe to remember, or None to leave as-is.
+        profile_id (str): Profile to update. Defaults to "default".
+
+    Returns:
+        dict: The updated, normalized profile dict as written to disk.
+    """
+    profile = load_style_profile(profile_id)
+    if size:
+        profile["preferred_size"] = size
+    if max_price is not None:
+        profile["max_price"] = float(max_price)
+    if styles:
+        existing = profile["favorite_styles"]
+        for tag in styles:
+            if tag and tag not in existing:
+                existing.append(tag)
+        profile["favorite_styles"] = existing[-_MAX_FAVORITE_STYLES:]
+    if wardrobe is not None and isinstance(wardrobe, dict):
+        profile["wardrobe"] = wardrobe
+    return save_style_profile(profile, profile_id)

@@ -19,7 +19,16 @@ Run from the project root:
 import json
 import pytest
 import tools
-from tools import create_fit_card, price_compare, search_listings, suggest_outfit
+from tools import (
+    create_fit_card,
+    load_style_profile,
+    price_compare,
+    save_style_profile,
+    search_listings,
+    search_with_fallback,
+    suggest_outfit,
+    update_style_profile,
+)
 
 # A minimal listing used as `new_item` in the LLM-tool tests.
 SAMPLE_ITEM = {
@@ -281,3 +290,139 @@ def test_price_compare_excludes_self():
     )
     # comparable_count can be <= peers (tag filtering narrows it) but never counts self.
     assert result["comparable_count"] <= category_peers
+
+
+# ── search_with_fallback (Pure, No Mocking) ──────────────────────────────────
+
+def test_fallback_no_adjustment_when_first_search_matches():
+    """Verify search_with_fallback reports no adjustments when the constrained search already matches."""
+    out = search_with_fallback("vintage graphic tee", size=None, max_price=50)
+    assert out["results"]
+    assert out["adjustments"] == []
+    assert out["size"] is None and out["max_price"] == 50
+
+
+def test_fallback_drops_size_when_no_size_match():
+    """Verify search_with_fallback drops an over-restrictive size and reports it.
+
+    No tee in the dataset is sized XS (they are S/M and L), so a size-XS tee
+    search is empty until the size filter is dropped; the helper must then find
+    tees and record the removed size filter.
+    """
+    out = search_with_fallback("graphic tee", size="XS", max_price=200)
+    assert out["results"], "expected tees once the size filter was dropped"
+    assert out["adjustments"] == ["removed the size XS filter"]
+    assert out["size"] is None        # size was relaxed
+    assert out["max_price"] == 200     # price was left intact
+
+
+def test_fallback_lifts_price_after_size():
+    """Verify search_with_fallback also lifts the price cap when dropping size alone is not enough."""
+    # A graphic tee exists but the cheapest is well above $1, so a $1 cap plus an
+    # impossible size forces both relaxations.
+    out = search_with_fallback("graphic tee", size="XS", max_price=1)
+    assert out["results"]
+    assert out["adjustments"] == [
+        "removed the size XS filter",
+        "lifted the $1 budget cap",
+    ]
+    assert out["size"] is None and out["max_price"] is None
+
+
+def test_fallback_genuine_no_match_returns_empty():
+    """Verify search_with_fallback returns an empty result (not a crash) when nothing matches even loosened."""
+    out = search_with_fallback("nonexistent unicorn garment", size="XXS", max_price=5)
+    assert out["results"] == []
+    # It still reports every loosening it attempted before giving up.
+    assert "removed the size XXS filter" in out["adjustments"]
+
+
+# ── Style Profile Memory ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def temp_profile(tmp_path, monkeypatch):
+    """
+    Redirect the style profile store to a temp file for the duration of a test.
+
+    Monkeypatches tools._PROFILE_PATH so load/save/update operate on an isolated
+    file under pytest's tmp_path, never touching a real style_profiles.json in the
+    project root. Returns the path for tests that want to inspect the raw file.
+
+    Returns:
+        pathlib.Path: The temp profile-store path now in use.
+    """
+    path = tmp_path / "style_profiles.json"
+    monkeypatch.setattr(tools, "_PROFILE_PATH", str(path))
+    return path
+
+
+def test_load_profile_returns_empty_when_none_saved(temp_profile):
+    """Verify load_style_profile returns a fresh empty profile (never None) before anything is saved."""
+    profile = load_style_profile("default")
+    assert profile == {
+        "preferred_size": None,
+        "max_price": None,
+        "favorite_styles": [],
+        "wardrobe": {"items": []},
+    }
+
+
+def test_save_then_load_round_trips(temp_profile):
+    """Verify a saved profile is read back identically (after normalization)."""
+    save_style_profile(
+        {
+            "preferred_size": "M",
+            "max_price": 30,
+            "favorite_styles": ["vintage", "grunge"],
+            "wardrobe": {"items": [{"id": "w1", "name": "jeans"}]},
+        },
+        "default",
+    )
+    loaded = load_style_profile("default")
+    assert loaded["preferred_size"] == "M"
+    assert loaded["max_price"] == 30.0
+    assert loaded["favorite_styles"] == ["vintage", "grunge"]
+    assert loaded["wardrobe"]["items"][0]["name"] == "jeans"
+
+
+def test_update_profile_merges_without_clobbering(temp_profile):
+    """Verify update_style_profile only overwrites provided fields and leaves omitted ones intact."""
+    update_style_profile(size="M", max_price=30, styles=["vintage"], profile_id="default")
+    # A later search that omits the size must NOT erase the remembered "M".
+    update_style_profile(max_price=45, styles=["grunge"], profile_id="default")
+    profile = load_style_profile("default")
+    assert profile["preferred_size"] == "M"        # preserved
+    assert profile["max_price"] == 45.0            # updated
+    assert profile["favorite_styles"] == ["vintage", "grunge"]  # appended, deduped
+
+
+def test_update_profile_dedupes_and_caps_styles(temp_profile):
+    """Verify favorite_styles never duplicates a tag and is capped at _MAX_FAVORITE_STYLES."""
+    update_style_profile(styles=["vintage", "vintage"], profile_id="default")
+    assert load_style_profile("default")["favorite_styles"] == ["vintage"]
+
+    many = [f"style{i}" for i in range(tools._MAX_FAVORITE_STYLES + 5)]
+    update_style_profile(styles=many, profile_id="default")
+    favorites = load_style_profile("default")["favorite_styles"]
+    assert len(favorites) == tools._MAX_FAVORITE_STYLES
+    # Newest tags are kept at the cap.
+    assert favorites[-1] == many[-1]
+
+
+def test_profiles_are_isolated_by_id(temp_profile):
+    """Verify saving one profile id does not clobber another stored in the same file."""
+    save_style_profile({"preferred_size": "S"}, "ana")
+    save_style_profile({"preferred_size": "XL"}, "ben")
+    assert load_style_profile("ana")["preferred_size"] == "S"
+    assert load_style_profile("ben")["preferred_size"] == "XL"
+
+
+def test_corrupt_profile_file_degrades_to_empty(temp_profile):
+    """Verify a corrupt store file is treated as no memory rather than raising."""
+    temp_profile.write_text("{ not valid json", encoding="utf-8")
+    assert load_style_profile("default") == {
+        "preferred_size": None,
+        "max_price": None,
+        "favorite_styles": [],
+        "wardrobe": {"items": []},
+    }

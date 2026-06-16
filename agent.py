@@ -8,6 +8,17 @@ branches: empty search results terminate early with an error, while
 suggest_outfit failure also terminates early; price_compare and create_fit_card
 failures are treated as partial successes and do not set the error field.
 
+The search step uses search_with_fallback(): when the fully constrained search
+returns nothing, it automatically retries with looser filters (size dropped
+first, then the price ceiling) and records what it adjusted in
+session["search_adjustments"] so the UI can tell the user.
+
+When a profile_id is supplied, run_agent loads a saved style profile and uses it
+to fill in any size/budget the query left out (recorded in
+session["profile_applied"]) and to supply a wardrobe when none was passed. With
+save_profile=True it writes the size, budget, item style tags, and wardrobe back
+to the profile so a returning user need not re-describe their preferences.
+
 Query parsing uses regex rather than an LLM call; the fields needed (a price
 number, a size token, leftover keywords) are cheap and deterministic to extract
 with patterns, avoiding an extra API hop and its latency/failure surface.
@@ -22,10 +33,22 @@ Usage:
     )
     print(result["fit_card"])
     print(result["error"])   # None on success
+
+    # Returning user — remember and reuse preferences across sessions:
+    result = run_agent(query="vintage graphic tee", profile_id="default",
+                        save_profile=True)
 """
 
 import re
-from tools import search_listings, price_compare, suggest_outfit, create_fit_card
+from tools import (
+    search_with_fallback,
+    price_compare,
+    suggest_outfit,
+    create_fit_card,
+    load_style_profile,
+    update_style_profile,
+)
+from utils.data_loader import get_empty_wardrobe
 
 
 # ── Query Parsing ─────────────────────────────────────────────────────────────
@@ -110,42 +133,64 @@ def _new_session(query: str, wardrobe: dict) -> dict:
 
     Returns:
         dict: A zeroed out session with keys: query, parsed, search_results,
-            selected_item, price_check, wardrobe, outfit_suggestion, fit_card,
-            error.
+            search_adjustments, selected_item, price_check, wardrobe,
+            outfit_suggestion, fit_card, profile_id, profile_applied,
+            profile_saved, error.
     """
     return {
         "query": query,              # Original user query
         "parsed": {},                # Extracted description / size / max_price
         "search_results": [],        # List of matching listing dicts
+        "search_adjustments": [],    # Filters loosened by the fallback retry, if any
         "selected_item": None,       # Top result, passed into suggest_outfit
         "price_check": None,         # Dict from price_compare (None = unavailable)
         "wardrobe": wardrobe,        # User's wardrobe dict
         "outfit_suggestion": None,   # String returned by suggest_outfit
         "fit_card": None,            # String returned by create_fit_card
+        "profile_id": None,          # Style profile id in use, or None
+        "profile_applied": [],       # Saved preferences applied to this query
+        "profile_saved": False,      # True if preferences were persisted this run
         "error": None,               # Set if the interaction ended early
     }
 
 
 # ── Planning Loop ─────────────────────────────────────────────────────────────
 
-def run_agent(query: str, wardrobe: dict) -> dict:
+def run_agent(
+    query: str,
+    wardrobe: dict | None = None,
+    profile_id: str | None = None,
+    save_profile: bool = False,
+) -> dict:
     """
     Run the FitFindr planning loop for a single user interaction.
 
-    Parses the query, searches listings, selects the top result, assesses whether
-    its price is fair, generates an outfit suggestion, and produces a fit card;
-    each step stored in the session dict. Two branches terminate early: empty
-    search results set session["error"] and return before suggest_outfit is
-    called; a suggest_outfit failure also sets the error and stops the loop. A
-    price_compare or create_fit_card failure is partial-success only;
-    session["price_check"] / session["fit_card"] is left as None but
-    session["error"] stays None.
+    Parses the query, searches listings (with automatic constraint loosening when
+    nothing matches), selects the top result, assesses whether its price is fair,
+    generates an outfit suggestion, and produces a fit card; each step stored in
+    the session dict. Two branches terminate early: empty search results set
+    session["error"] and return before suggest_outfit is called; a suggest_outfit
+    failure also sets the error and stops the loop. A price_compare or
+    create_fit_card failure is partial-success only; session["price_check"] /
+    session["fit_card"] is left as None but session["error"] stays None.
+
+    When profile_id is given, a saved style profile is loaded and used to fill in
+    any size/budget the query omitted (recorded in session["profile_applied"]) and
+    to supply the wardrobe when the wardrobe argument is None. With
+    save_profile=True, the size, budget, selected item's style tags, and wardrobe
+    are written back to that profile at the end of a (full or fit-card-partial)
+    successful run so a returning user need not re-describe their preferences.
 
     Args:
         query (str): Natural language user request
             (e.g., "vintage graphic tee under $30, size M").
-        wardrobe (dict): User's wardrobe dict — pass get_example_wardrobe() or
-            get_empty_wardrobe() from utils/data_loader.py.
+        wardrobe (dict | None): User's wardrobe dict — pass get_example_wardrobe()
+            or get_empty_wardrobe() from utils/data_loader.py. When None, the
+            profile's saved wardrobe is used, falling back to an empty wardrobe.
+        profile_id (str | None): Style profile to load/apply, or None to skip
+            cross-session memory entirely.
+        save_profile (bool): When True (and profile_id is set), persist the
+            preferences observed this run for next time.
 
     Returns:
         dict: The completed session dict. Check session["error"] first. If it
@@ -155,16 +200,42 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     # Step 1 — initialize the single source of truth for this interaction.
     session = _new_session(query, wardrobe)
+    session["profile_id"] = profile_id
+
+    # Step 1b — load remembered preferences, if a profile was requested. The
+    # profile supplies defaults for anything the query leaves unspecified and a
+    # wardrobe when the caller passed none, so a returning user can search with
+    # a bare description and still get size/budget/wardrobe applied.
+    profile = load_style_profile(profile_id) if profile_id else None
 
     # Step 2 — parse the query into search parameters (regex, see _parse_query).
-    session["parsed"] = _parse_query(query)
-    parsed = session["parsed"]
+    parsed = _parse_query(query)
 
-    # Step 3 — search. An unexpected exception (e.g. corrupt data file) is
-    # distinct from "no matches": the former stops with a generic error, the
-    # latter stops with a helpful "broaden your search" message.
+    if profile:
+        applied = []
+        if parsed["size"] is None and profile.get("preferred_size"):
+            parsed["size"] = profile["preferred_size"]
+            applied.append(f"size {profile['preferred_size']}")
+        if parsed["max_price"] is None and profile.get("max_price") is not None:
+            parsed["max_price"] = profile["max_price"]
+            applied.append(f"budget ${profile['max_price']:.0f}")
+        session["profile_applied"] = applied
+
+    session["parsed"] = parsed
+
+    # Resolve the wardrobe: an explicit argument wins; otherwise reuse the
+    # profile's saved wardrobe, then fall back to an empty one.
+    if wardrobe is None:
+        wardrobe = (profile.get("wardrobe") if profile else None) or get_empty_wardrobe()
+    session["wardrobe"] = wardrobe
+
+    # Step 3 — search with automatic fallback. An unexpected exception (e.g.
+    # corrupt data file) is distinct from "no matches": the former stops with a
+    # generic error, the latter stops with a helpful "broaden your search"
+    # message. When the first search is empty, search_with_fallback retries with
+    # looser filters and reports what it adjusted.
     try:
-        results = search_listings(
+        search = search_with_fallback(
             description=parsed["description"],
             size=parsed["size"],
             max_price=parsed["max_price"],
@@ -173,7 +244,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         session["error"] = "Search failed due to an unexpected error. Please try again."
         return session
 
+    results = search["results"]
     session["search_results"] = results
+    session["search_adjustments"] = search["adjustments"]
 
     # Branch on the search result; this is the key conditional in the loop.
     # An empty list ends the interaction; we do NOT proceed to suggest_outfit.
@@ -184,10 +257,15 @@ def run_agent(query: str, wardrobe: dict) -> dict:
             if parsed["max_price"] is not None
             else "your budget"
         )
-        session["error"] = (
+        msg = (
             f"No listings matched '{parsed['description']}' in size {size_txt} "
-            f"under {price_txt}. Try a broader description, a higher budget, or "
-            f"a different size."
+            f"under {price_txt}"
+        )
+        if search["adjustments"]:
+            # We already loosened filters and still found nothing; say so.
+            msg += f" — even after we {' and '.join(search['adjustments'])}"
+        session["error"] = (
+            msg + ". Try a broader description, a higher budget, or a different size."
         )
         return session
 
@@ -227,7 +305,23 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     except Exception:
         session["fit_card"] = None
 
-    # Step 8 — return the completed session.
+    # Step 8 — remember preferences for next session, if requested. This runs on
+    # full and fit card partial success (the search/outfit both succeeded). A
+    # write failure is non-fatal: the result is still returned, just unsaved.
+    if save_profile and profile_id:
+        try:
+            update_style_profile(
+                size=parsed["size"],
+                max_price=parsed["max_price"],
+                styles=session["selected_item"].get("style_tags", []),
+                wardrobe=wardrobe,
+                profile_id=profile_id,
+            )
+            session["profile_saved"] = True
+        except Exception:
+            session["profile_saved"] = False
+
+    # Step 9 — return the completed session.
     return session
 
 
@@ -255,3 +349,12 @@ if __name__ == "__main__":
         wardrobe=get_example_wardrobe(),
     )
     print(f"Error message: {session2['error']}")
+
+    print("\n\n=== Retry With Fallback (no tee in size XS → drop size) ===\n")
+    session3 = run_agent(
+        query="vintage graphic tee size XS under $40",
+        wardrobe=get_example_wardrobe(),
+    )
+    print(f"Adjustments: {session3['search_adjustments']}")
+    if session3["selected_item"]:
+        print(f"Found anyway: {session3['selected_item']['title']}")
