@@ -15,7 +15,7 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 | **Input: `description`** | `str` — Keywords describing the item (e.g., `"vintage graphic tee"`). Stopwords and filler are stripped; whole-word token matching prevents substring noise. |
 | **Input: `size`** | `str \| None` — Size filter (e.g., `"M"`, `"XL"`, `"8"`). Apparel sizes and numeric shoe/waist sizes are treated as separate systems, so requesting size `"M"` does not exclude shoes. `None` skips size filtering. |
 | **Input: `max_price`** | `float \| None` — Price ceiling (inclusive bound). `None` skips price filtering. |
-| **Output** | `list[dict]` — Matching listing dicts sorted by weighted relevance (style tags > title/colors/category/brand > description). Empty list `[]` if nothing matches (never raises). |
+| **Output** | `list[dict]`: Matching listing dicts sorted by weighted relevance (style tags > title/colors/category/brand > description). Empty list `[]` if nothing matches (never raises). |
 
 **Purpose:** Pure keyword + hard-filter search over the 40-item mock dataset (`data/listings.json`). No LLM call & fully deterministic semantic approach. The agent's entry point: if this returns empty, the loop stops here.
 
@@ -150,7 +150,7 @@ The implementation follows the planning.md spec closely. The three tools cover e
 ---
 
 <!--
-## Original Starter Kit README (commented out — preserved for reference)
+## Original Starter Kit README (commented out; preserved for reference)
 
 # FitFindr — Starter Kit
 

@@ -1,6 +1,6 @@
 # FitFindr — planning.md
 
-> **Status: Implementation complete.** All three tools are implemented and tested. The planning loop, state management, and error handling described below match the final code in `tools.py`, `agent.py`, and `app.py`.
+> **Status: Implementation complete.** All three tools have been implemented & unit tested. The planning loop, state management, and error handling described below match the final code in `tools.py`, `agent.py`, and `app.py`.
 > This document was written before implementation and updated to reflect what actually shipped, including deviations noted in the Spec Reflection section of README.md.
 
 ---
@@ -326,9 +326,9 @@ If `search_listings` returns `[]`:
 ### What shipped vs. what was planned
 
 **`search_listings` (tools.py:190)**
-- Implemented as planned. Added `_STOPWORDS`, `_tokens()`, and whole-word token matching to prevent substring noise (e.g., `"we"` matching `"western"` style tags).
-- Size filtering required a dedicated `_size_matches()` function to handle two incompatible sizing systems (alpha apparel vs. numeric shoe/waist). Cross-system requests pass through without excluding unrelated categories.
-- Relevance is scored by `_relevance_score()` with weighted tiers: style tags (3pts) > title/colors/category/brand (2pts) > description (1pt). Ties broken by price ascending.
+- Implemented as planned. Added `_STOPWORDS`, `_tokens()`, and whole word token matching to prevent substring noise (e.g., `"we"` matching `"western"` style tags).
+- Size filtering required a dedicated `_size_matches()` function to handle two incompatible sizing systems (alpha apparel vs. numeric shoe and/or waist). Cross-system requests pass through without excluding unrelated categories.
+- Relevance is scored by `_relevance_score()` with weighted tiers: style tags (3 pts) > title/colors/category/brand (2 pts) > description (1 pt). Ties are broken by price ascending.
 
 **`suggest_outfit` (tools.py:297)**
 - Return type is `dict` (not `str`) with keys `outfit_description`, `matching_items`, `style_reasoning`, `style_category`. This matches the spec.
@@ -337,14 +337,14 @@ If `search_listings` returns `[]`:
 
 **`create_fit_card` (tools.py:403)**
 - Returns `dict` with keys `fit_card_text`, `style_tags`, `caption_tone`.
-- Runs at `temperature=1.0` for caption variety.
+- Runs at `temperature=1.0` for dynamic caption variety upon regeneration.
 - Missing or empty `outfit_description` routes to a simplified item-only prompt (no crash, no None return).
 - `style_tags` is capped at 4 items by `_normalize_fit_card()`.
 
 **Planning loop (agent.py:110)**
 - `_parse_query()` (regex) extracts `description`, `size`, `max_price` — no LLM call at parse time.
 - `create_fit_card` failure is a partial success: `session["fit_card"] = None`, session still returned.
-- Session dict uses `"error"` key (not `"error_message"` as originally spec'd — simplified for consistency).
+- Session dict uses `"error"` key (not `"error_message"` as originally specified; simplified for consistency).
 
 **Gradio UI (app.py)**
 - `handle_query()` maps the session dict to three output panels via `_format_listing()`, `_format_outfit()`, `_format_fit_card()`.
@@ -361,3 +361,12 @@ If `search_listings` returns `[]`:
 | [utils/data_loader.py](utils/data_loader.py) | Dataset + wardrobe loaders |
 | [data/listings.json](data/listings.json) | 40 mock secondhand listings |
 | [data/wardrobe_schema.json](data/wardrobe_schema.json) | Wardrobe format + example wardrobe |
+
+<!--
+## Original Starter Kit plannind.md (commented out; preserved for reference)
+
+> Complete this document before writing any implementation code.
+> Your spec and agent diagram are what you'll use to direct AI tools to generate your implementation — the more specific they are, the more useful the generated code will be.
+> Your planning.md will be reviewed as part of your submission.
+> Update it before starting any stretch features.
+-->
