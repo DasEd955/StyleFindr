@@ -419,7 +419,7 @@ If `search_listings` returns `[]`:
 | [data/wardrobe_schema.json](data/wardrobe_schema.json) | Wardrobe format + example wardrobe |
 
 <!--
-## Original Starter Kit plannind.md (commented out; preserved for reference)
+## Original Starter Kit plannind.md (commented out & preserved for reference)
 
 > Complete this document before writing any implementation code.
 > Your spec and agent diagram are what you'll use to direct AI tools to generate your implementation — the more specific they are, the more useful the generated code will be.
