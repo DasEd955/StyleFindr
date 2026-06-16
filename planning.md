@@ -135,6 +135,8 @@ The agent uses a sequential conditional loop. It does NOT call all tools in a fi
 
 **The key behavioral rule:** The agent changes behavior based on what each tool returns. An empty list from `search_listings` stops the loop entirely. An empty wardrobe triggers a fallback path — but does not stop the loop. A failed fit card degrades gracefully without hiding the outfit result.
 
+**Query parsing (Step 1 choice):** Parsing the natural-language query into `description` / `size` / `max_price` is done with **regex/string parsing**, not an LLM call. The three fields are cheap and deterministic to extract — a price number (`under $30` or a bare `$30`), a size token (`size M` or a standalone `XS`/`S`/`M`/`L`/`XL`/`XXS`/`XXL`), and the leftover keywords as the description. Avoiding an LLM hop here keeps Step 1 fast and removes a failure surface before any tool runs. (Implemented as `_parse_query()` in `agent.py`.)
+
 ---
 
 ## State Management
