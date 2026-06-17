@@ -152,6 +152,78 @@ Step 7 — Return completed session dict
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    A[User Query] --> P0{profile_id\nsupplied?}
+    P0 -->|Yes| P1[load_style_profile\nfill missing size / budget\nresolve wardrobe]
+    P0 -->|No| B
+    P1 --> B
+
+    B[Planning Loop\nparse description, size, max_price] --> C[search_with_fallback\ndescription, size, max_price]
+
+    C --> D{results after\nfull constraints?}
+    D -->|Yes| F[State: selected_item = results 0\nsearch_adjustments = empty]
+    D -->|No| FB1[Retry: drop size filter\nrecord adjustment]
+    FB1 --> FB2{results?}
+    FB2 -->|Yes| FBR[State: selected_item = results 0\nsearch_adjustments = size dropped]
+    FB2 -->|No| FB3[Retry: lift price ceiling\nrecord adjustment]
+    FB3 --> FB4{results?}
+    FB4 -->|Yes| FBR2[State: selected_item = results 0\nsearch_adjustments = size + price dropped]
+    FB4 -->|No| E[error_message:\nNo listings found — all filters tried]
+    E --> Z[End Session — no results]
+
+    F --> PC
+    FBR --> PC
+    FBR2 --> PC
+
+    PC[price_compare\nselected_item] --> PD{comparables &ge; 2\nand price usable?}
+    PD -->|No| PE[price_check = insufficient_data / None\npartial success — continue]
+    PD -->|Yes| PF[State: price_check = verdict + comparables]
+    PE --> G[Wardrobe resolved in Step 0\nor get_empty_wardrobe fallback]
+    PF --> G
+
+    G --> H[suggest_outfit\nselected_item + wardrobe]
+
+    H --> I{LLM call failed?}
+    I -->|Yes| J[error_message:\nOutfit generation failed]
+    J --> Z2[End Session — outfit error]
+
+    I -->|No| K{wardrobe empty?}
+    K -->|Yes| L[Fallback: generic staples\nnotify user]
+    K -->|No| M[Personalized outfit]
+
+    L --> N[State: selected_outfit = result]
+    M --> N
+
+    N --> O[create_fit_card\nselected_outfit + selected_item]
+
+    O --> PP{LLM call failed?}
+    PP -->|Yes| Q[Display outfit only\nno fit card — partial success]
+    PP -->|No| R[State: fit_card = result]
+
+    R --> SP{save_profile=True\nand no hard error?}
+    SP -->|Yes| SPW[update_style_profile\nsize, budget, style_tags, wardrobe\nprofile_saved = True]
+    SP -->|No| S
+    SPW --> S
+
+    Q --> S[Display: profile_applied notice\n+ search_adjustments notice\n+ selected_item + price_check\n+ outfit_description\n+ fit_card_text + style_tags]
+
+    S --> Z3[End Session — success]
+
+    ST[(Session State\nquery, parsed, search_results,\nsearch_adjustments, selected_item,\nprice_check, wardrobe, outfit_suggestion,\nfit_card, profile_id, profile_applied,\nprofile_saved, error)]
+
+    B <--> ST
+    F --> ST
+    PF --> ST
+    N --> ST
+    R --> ST
+    SPW --> ST
+```
+
+---
+
 ## State Management
 
 **File:** [agent.py:86](agent.py#L86)
