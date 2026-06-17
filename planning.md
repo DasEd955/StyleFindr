@@ -1,6 +1,6 @@
 # FitFindr — planning.md
 
-> **Status: Implementation complete.** All three tools have been implemented & unit tested. The planning loop, state management, and error handling described below match the final code in `tools.py`, `agent.py`, and `app.py`.
+> **Status: Implementation Complete.** All four tools have been implemented & unit tested. Style Profile Memory and retry logic with fallback have been added. The planning loop, state management, and error handling described below match the final code in `tools.py`, `agent.py`, and `app.py`.
 > This document was written before implementation and updated to reflect what actually shipped, including deviations noted in the Spec Reflection section of README.md.
 
 ---
@@ -124,16 +124,24 @@ A listing is defined as comparable when it is in the same `category` AND shares 
 The agent uses a sequential conditional loop. It does NOT call all tools in a fixed order regardless of results. Each step checks the previous output before proceeding.
 
 ```
+0. Load style profile (if profile_id supplied)
+   → Apply saved preferred_size to query if size was not provided
+   → Apply saved max_price to query if budget was not provided
+   → Record each applied preference in session.profile_applied
+   → Resolve wardrobe: explicit arg > profile wardrobe > empty wardrobe
+
 1. Parse user query → extract description, size, max_price
    Store in session: { description, size, max_price, user_query }
 
-2. Call search_listings(description, size, max_price)
-   → If results == []:
+2. Call search_with_fallback(description, size, max_price)
+   → If exact search returns results:
+       Set session.selected_item = results[0]. Continue.
+   → If empty: retry without size filter; record "removed the size X filter"
+   → If still empty: retry without price ceiling; record "lifted the $X budget cap"
+   → Store all relaxations in session.search_adjustments.
+   → If still empty after all relaxations:
        Set session.error_message = "No listings found..."
        Return error to user. STOP.
-   → If results is not empty:
-       Set session.selected_item = results[0]
-       Continue to step 3.
 
 3. Call price_compare(session.selected_item)
    → On any unexpected error:
@@ -141,8 +149,7 @@ The agent uses a sequential conditional loop. It does NOT call all tools in a fi
    → Otherwise:
        Set session.price_check = result (verdict + comparables). Continue.
 
-4. Load wardrobe via get_example_wardrobe() (or get_empty_wardrobe() in testing)
-   Store in session: { wardrobe }
+4. Load wardrobe (resolved in step 0 — already in session.wardrobe)
 
 5. Call suggest_outfit(session.selected_item, session.wardrobe)
    → If LLM call fails or returns None:
@@ -163,8 +170,14 @@ The agent uses a sequential conditional loop. It does NOT call all tools in a fi
        Set session.fit_card = result
        Continue to step 7.
 
-7. Display final output to user:
+7. Save style profile (if save_profile=True and no hard error)
+   → Persist: size, max_price, selected item style_tags, wardrobe
+   → Set session.profile_saved = True
+
+8. Display final output to user:
+   - Profile notice: session.profile_applied (if any)
    - Best match: session.selected_item (title, price, platform, condition)
+   - Search adjustments: session.search_adjustments (if any filters were relaxed)
    - Price check: session.price_check (verdict + explanation), if available
    - Outfit suggestion: session.selected_outfit.outfit_description
    - Fit card: session.fit_card.fit_card_text + style_tags
@@ -186,12 +199,16 @@ Tracked state:
 - `description` (str): Extracted item description
 - `size` (str): Extracted size
 - `max_price` (float): Extracted maximum price
-- `search_results` (list[dict]): Full list returned by `search_listings()`
+- `search_results` (list[dict]): Full list returned by `search_with_fallback()`
+- `search_adjustments` (list[str]): Filters loosened by the fallback retry; empty when the first search matched
 - `selected_item` (dict): `search_results[0]` — the top-ranked listing
 - `price_check` (dict | None): Full dict returned by `price_compare()`; `None` on partial failure
-- `wardrobe` (dict): Loaded once via `get_example_wardrobe()` or `get_empty_wardrobe()`
+- `wardrobe` (dict): Resolved wardrobe — explicit arg, profile-saved wardrobe, or empty fallback
 - `selected_outfit` (dict): Full dict returned by `suggest_outfit()`
 - `fit_card` (dict): Full dict returned by `create_fit_card()`
+- `profile_id` (str | None): Style profile id in use, or None
+- `profile_applied` (list[str]): Saved preferences applied to this query (e.g. `["size M", "budget $50"]`)
+- `profile_saved` (bool): True if preferences were persisted to disk this run
 - `error_message` (str | None): Set when any tool fails; controls early termination
 
 Data flow: `selected_item` is passed directly into `price_compare`, `suggest_outfit`, and `create_fit_card` without user re-entry. `selected_outfit` and `selected_item` are both passed into `create_fit_card`. The user never needs to repeat information between steps.
@@ -202,7 +219,8 @@ Data flow: `selected_item` is passed directly into `price_compare`, `suggest_out
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| `search_listings` | Returns empty list | Tell user: "No matches for [query] in size [size] under $[price]. Try broadening your description or raising your budget." Stop workflow. |
+| `search_with_fallback` | Returns empty list after all relaxations | Tell user: "No matches for [query]…" with each attempted relaxation listed. Stop workflow. |
+| `search_with_fallback` | Results found only after loosening filters | Continue; surface `search_adjustments` in the UI so user knows what changed. |
 | `search_listings` | Unexpected exception | Log error, tell user: "Search failed due to an unexpected error. Please try again." Stop workflow. |
 | `price_compare` | Fewer than 2 comparables, or item has no usable price | Returns `verdict = "insufficient_data"`; the UI simply omits the price verdict. Loop **continues** (not an error). |
 | `price_compare` | Unexpected exception | Set `session.price_check = None`. Loop continues (partial success); the listing is still shown without a price verdict. |
@@ -217,20 +235,32 @@ Data flow: `selected_item` is passed directly into `price_compare`, `suggest_out
 
 ```mermaid
 flowchart TD
-    A[User Query] --> B[Planning Loop\nparse description, size, max_price]
-    B --> C[search_listings\ndescription, size, max_price]
+    A[User Query] --> P0{profile_id\nsupplied?}
+    P0 -->|Yes| P1[load_style_profile\nfill missing size / budget\nresolve wardrobe]
+    P0 -->|No| B
+    P1 --> B
 
-    C --> D{results == empty?}
-    D -->|Yes| E[error_message:\nNo listings found]
+    B[Planning Loop\nparse description, size, max_price] --> C[search_with_fallback\ndescription, size, max_price]
+
+    C --> D{results after\nfull constraints?}
+    D -->|Yes| F[State: selected_item = results 0\nsearch_adjustments = empty]
+    D -->|No| FB1[Retry: drop size filter\nrecord adjustment]
+    FB1 --> FB2{results?}
+    FB2 -->|Yes| FBR[State: selected_item = results 0\nsearch_adjustments = size dropped]
+    FB2 -->|No| FB3[Retry: lift price ceiling\nrecord adjustment]
+    FB3 --> FB4{results?}
+    FB4 -->|Yes| FBR2[State: selected_item = results 0\nsearch_adjustments = size + price dropped]
+    FB4 -->|No| E[error_message:\nNo listings found — all filters tried]
     E --> Z[End Session — no results]
 
-    D -->|No| F[State: selected_item = results 0]
+    F --> PC
+    FBR --> PC
+    FBR2 --> PC
 
-    F --> PC[price_compare\nselected_item]
-    PC --> PD{comparables &ge; 2\nand price usable?}
+    PC[price_compare\nselected_item] --> PD{comparables &ge; 2\nand price usable?}
     PD -->|No| PE[price_check = insufficient_data / None\npartial success — continue]
     PD -->|Yes| PF[State: price_check = verdict + comparables]
-    PE --> G[Load wardrobe\nget_example_wardrobe or get_empty_wardrobe]
+    PE --> G[Wardrobe resolved in Step 0\nor get_empty_wardrobe fallback]
     PF --> G
 
     G --> H[suggest_outfit\nselected_item + wardrobe]
@@ -248,22 +278,27 @@ flowchart TD
 
     N --> O[create_fit_card\nselected_outfit + selected_item]
 
-    O --> P{LLM call failed?}
-    P -->|Yes| Q[Display outfit only\nno fit card — partial success]
-    P -->|No| R[State: fit_card = result]
+    O --> PP{LLM call failed?}
+    PP -->|Yes| Q[Display outfit only\nno fit card — partial success]
+    PP -->|No| R[State: fit_card = result]
 
-    R --> S[Display: selected_item + price_check\n+ outfit_description\n+ fit_card_text + style_tags]
-    Q --> S
+    R --> SP{save_profile=True\nand no hard error?}
+    SP -->|Yes| SPW[update_style_profile\nsize, budget, style_tags, wardrobe\nprofile_saved = True]
+    SP -->|No| S
+    SPW --> S
+
+    Q --> S[Display: profile_applied notice\n+ search_adjustments notice\n+ selected_item + price_check\n+ outfit_description\n+ fit_card_text + style_tags]
 
     S --> Z3[End Session — success]
 
-    ST[(Session State\nuser_query, description, size,\nmax_price, search_results,\nselected_item, price_check, wardrobe,\nselected_outfit, fit_card,\nerror_message)]
+    ST[(Session State\nquery, parsed, search_results,\nsearch_adjustments, selected_item,\nprice_check, wardrobe, outfit_suggestion,\nfit_card, profile_id, profile_applied,\nprofile_saved, error)]
 
     B <--> ST
     F --> ST
     PF --> ST
     N --> ST
     R --> ST
+    SPW --> ST
 ```
 
 ---
@@ -396,11 +431,24 @@ If `search_listings` returns `[]`:
 - Comparables are selected by `_find_comparables()` — same category plus shared style tag, with a same-category fallback when too few peers exist. The item itself is excluded by `id`.
 - The verdict is computed from the median of comparables via `_price_verdict()` with the `0.85` / `1.15` ratio bands. Thin data (< 2 comparables) or a missing/non-numeric price returns `"insufficient_data"` rather than raising.
 
-**Planning loop (agent.py:110)**
+**`search_with_fallback` (tools.py:337)**
+- Wraps `search_listings` with two-stage relaxation: drop size first, then lift the price ceiling.
+- Each loosening is recorded as a human-readable string in `adjustments` (e.g. `"removed the size M filter"`).
+- Returns the empty list plus all attempted adjustments if nothing matches even without filters — never raises.
+
+**Style Profile Memory (tools.py:901)**
+- `load_style_profile(profile_id)` reads `data/style_profiles.json`; returns an empty profile (not `None`) on first use or a corrupt file.
+- `save_style_profile` / `update_style_profile` normalize the profile to the contract shape before writing, so hand-edited or partially-populated files can't crash the agent.
+- Profile fields: `preferred_size`, `max_price`, `favorite_styles` (capped at 10), `wardrobe`.
+
+**Planning loop (agent.py:133)**
 - `_parse_query()` (regex) extracts `description`, `size`, `max_price` — no LLM call at parse time.
+- Step 0 (new): loads the style profile and fills in missing `size` / `max_price` from saved preferences; resolves the wardrobe.
+- Step 2 now calls `search_with_fallback` instead of `search_listings`; `session["search_adjustments"]` carries the loosening record.
 - `price_compare` runs right after the top listing is selected; its result is stored in `session["price_check"]`. An unexpected error leaves `price_check = None` (partial success), so the price step never stops the loop.
 - `create_fit_card` failure is a partial success: `session["fit_card"] = None`, session still returned.
 - Session dict uses `"error"` key (not `"error_message"` as originally specified; simplified for consistency).
+- New session keys: `search_adjustments`, `profile_id`, `profile_applied`, `profile_saved`.
 
 **Gradio UI (app.py)**
 - `handle_query()` maps the session dict to three output panels via `_format_listing()`, `_format_outfit()`, `_format_fit_card()`. The price verdict is folded into the listing panel by `_format_price()`.
@@ -410,13 +458,15 @@ If `search_listings` returns `[]`:
 
 | File | Role |
 |------|------|
-| [tools.py](tools.py) | All four tools + LLM helpers |
-| [agent.py](agent.py) | Planning loop, query parser, session state |
-| [app.py](app.py) | Gradio UI, query handler, output formatters |
-| [tests/test_tools.py](tests/test_tools.py) | 31 pytest tests covering all tools and failure modes |
+| [tools.py](tools.py) | All four tools + search fallback + style profile memory + LLM helpers |
+| [agent.py](agent.py) | Planning loop, query parser, session state, profile load/save |
+| [app.py](app.py) | Gradio UI, query handler, output formatters, profile/adjustment banners |
+| [tests/test_tools.py](tests/test_tools.py) | pytest tests covering all tools, fallback retry, and profile memory |
+| [tests/test_agent.py](tests/test_agent.py) | pytest tests covering the planning loop and profile integration |
 | [utils/data_loader.py](utils/data_loader.py) | Dataset + wardrobe loaders |
 | [data/listings.json](data/listings.json) | 40 mock secondhand listings |
 | [data/wardrobe_schema.json](data/wardrobe_schema.json) | Wardrobe format + example wardrobe |
+| [data/style_profiles.json](data/style_profiles.json) | Persisted style profiles (created on first save) |
 
 <!--
 ## Original Starter Kit plannind.md (commented out & preserved for reference)

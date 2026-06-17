@@ -6,6 +6,8 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 
 ## Tool Inventory & Outline
 
+> **Latest additions:** Style Profile Memory (`load_style_profile`, `save_style_profile`, `update_style_profile`) and retry logic with fallback (`search_with_fallback`). See [Tool 1b](#tool-1b-search_with_fallback) and [Style Profile Memory](#style-profile-memory) below.
+
 ### Tool 1: `search_listings`
 
 **File:** [tools.py:190](tools.py#L190)
@@ -18,6 +20,21 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 | **Output** | `list[dict]`: Matching listing dicts sorted by weighted relevance (style tags > title/colors/category/brand > description). Empty list `[]` if nothing matches (never raises). |
 
 **Purpose:** Pure keyword + hard-filter search over the 40-item mock dataset (`data/listings.json`). No LLM call & fully deterministic semantic approach. The agent's entry point: if this returns empty, the loop stops here.
+
+---
+
+### Tool 1b: `search_with_fallback`
+
+**File:** [tools.py:337](tools.py#L337)
+
+| | |
+|---|---|
+| **Input: `description`** | `str` — Passed through unchanged to `search_listings`. |
+| **Input: `size`** | `str \| None` — Size filter; relaxed first if the initial search is empty. |
+| **Input: `max_price`** | `float \| None` — Price ceiling; relaxed second if size relaxation also fails. |
+| **Output** | `dict` with keys: `results` (list[dict]), `adjustments` (list[str] — each filter that was loosened), `size` (str \| None — the filter actually used), `max_price` (float \| None — the ceiling actually used). |
+
+**Purpose:** Wraps `search_listings` with automatic constraint loosening. Calls the full search first; if empty, drops the size filter and retries; if still empty, lifts the price ceiling and retries. Each relaxation is recorded in `adjustments` so the UI can tell the user exactly what changed (e.g. *"removed the size M filter"*). Returns an empty list with all adjustments listed if nothing matches even without any filters — never raises on an empty result.
 
 ---
 
@@ -62,6 +79,29 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 
 ---
 
+### Style Profile Memory
+
+**File:** [tools.py:901](tools.py#L901)
+
+Cross-session preference storage. A profile is a JSON object with four fields:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `preferred_size` | `str \| None` | Size token applied to queries that omit a size |
+| `max_price` | `float \| None` | Budget ceiling applied to queries that omit a price |
+| `favorite_styles` | `list[str]` | Style tags accumulated from past selected items (capped at 10) |
+| `wardrobe` | `dict` | Saved wardrobe reused when no wardrobe is passed at call time |
+
+**Key functions:**
+
+- **`load_style_profile(profile_id)`** — reads the profile store (`data/style_profiles.json`) and returns the normalized profile for the given id; returns a fresh empty profile (never `None`) when none exists yet.
+- **`save_style_profile(profile, profile_id)`** — normalizes and writes a profile dict to disk without clobbering other profile ids.
+- **`update_style_profile(profile_id, size, max_price, style_tags, wardrobe)`** — convenience writer used by `run_agent` at the end of a successful run to merge the current session's preferences into the saved profile.
+
+**How the agent uses it:** When `run_agent` is called with a `profile_id`, it loads the profile before parsing the query and uses saved `preferred_size` / `max_price` to fill in any field the query left unspecified. Each applied preference is recorded in `session["profile_applied"]` so the UI can surface it. With `save_profile=True`, the session's size, budget, selected item's style tags, and wardrobe are written back at the end of a successful run, so a returning user need not re-describe their preferences.
+
+---
+
 ## Planning Loop
 
 **File:** [agent.py:110](agent.py#L110)
@@ -69,13 +109,20 @@ A multi-tool AI agent that helps users find secondhand clothing listings, sugges
 The agent uses a **sequential conditional loop**: each step checks the previous output before deciding whether to continue. Tools are not called unconditionally & are instead approached dynamically based on output.
 
 ```
+Step 0 — Load style profile (if profile_id supplied)
+         Apply saved size/budget to any field left unspecified by query
+         Record applied preferences in session["profile_applied"]
+         Resolve wardrobe: explicit arg > profile wardrobe > empty wardrobe
+
 Step 1 — Parse query (regex, no LLM)
          Extract: description, size, max_price
          Store in session["parsed"]
 
-Step 2 — search_listings(description, size, max_price)
-         → Empty list?  Set session["error"], STOP (no results message)
-         → Results?     session["selected_item"] = results[0], continue
+Step 2 — search_with_fallback(description, size, max_price)
+         → Exact search returns results? session["selected_item"] = results[0], continue
+         → Empty? Retry without size filter; if still empty, retry without price cap
+         → Record each loosened constraint in session["search_adjustments"]
+         → Still empty after all relaxations? Set session["error"], STOP
 
 Step 3 — price_compare(selected_item)
          → Error?       session["price_check"] = None, continue (partial success)
@@ -92,7 +139,11 @@ Step 5 — create_fit_card(outfit_suggestion, selected_item)
          → LLM failure? session["fit_card"] = None, continue (partial success)
          → Success?     session["fit_card"] = fit_card, continue
 
-Step 6 — Return completed session dict
+Step 6 — Save style profile (if save_profile=True and no hard error)
+         Persist: size, max_price, item style_tags, wardrobe
+         Set session["profile_saved"] = True
+
+Step 7 — Return completed session dict
 ```
 
 **Query Parsing Choice:** Step 1 uses regex (`_parse_query()` in [agent.py:38](agent.py#L38)), not an LLM call. Price numbers (`under $30`, `$30`), size tokens (`size M`, standalone `XS`/`S`/`M`/`L`/`XL`), and leftover keywords are cheap and deterministic to extract with patterns. Skipping an LLM hop here reduces latency and removes a failure surface before any tool runs.
@@ -109,19 +160,23 @@ A single **session dict** is initialized at the start of each `run_agent()` call
 
 ```python
 session = {
-    "query":             str,          # Original user query (unchanged throughout)
-    "parsed":            dict,         # {description, size, max_price} from _parse_query
-    "search_results":    list[dict],   # Full list from search_listings
-    "selected_item":     dict | None,  # search_results[0] — top-ranked listing
-    "price_check":       dict | None,  # Full dict from price_compare (None = partial success)
-    "wardrobe":          dict,         # Loaded once, passed directly to suggest_outfit
-    "outfit_suggestion": dict | None,  # Full dict from suggest_outfit
-    "fit_card":          dict | None,  # Full dict from create_fit_card (None = partial success)
-    "error":             str | None,   # Set on early termination; None on success
+    "query":              str,          # Original user query (unchanged throughout)
+    "parsed":             dict,         # {description, size, max_price} from _parse_query
+    "search_results":     list[dict],   # Full list from search_with_fallback
+    "search_adjustments": list[str],    # Filters loosened by the fallback retry (empty = exact match)
+    "selected_item":      dict | None,  # search_results[0] — top-ranked listing
+    "price_check":        dict | None,  # Full dict from price_compare (None = partial success)
+    "wardrobe":           dict,         # Resolved wardrobe: explicit arg > profile > empty
+    "outfit_suggestion":  dict | None,  # Full dict from suggest_outfit
+    "fit_card":           dict | None,  # Full dict from create_fit_card (None = partial success)
+    "profile_id":         str | None,   # Style profile id in use, or None
+    "profile_applied":    list[str],    # Saved preferences applied to this query
+    "profile_saved":      bool,         # True if preferences were persisted this run
+    "error":              str | None,   # Set on early termination; None on success
 }
 ```
 
-**Data flow:** `selected_item` passes directly from `search_listings` into `price_compare`, `suggest_outfit`, and `create_fit_card` without user re-entry. Both `outfit_suggestion` and `selected_item` pass directly into `create_fit_card`. The Gradio UI ([app.py:23](app.py#L23)) reads `session["selected_item"]`, `session["price_check"]`, `session["outfit_suggestion"]`, and `session["fit_card"]` to populate the output panels; the price verdict is folded into the listing panel.
+**Data flow:** `selected_item` passes directly from `search_with_fallback` into `price_compare`, `suggest_outfit`, and `create_fit_card` without user re-entry. Both `outfit_suggestion` and `selected_item` pass directly into `create_fit_card`. The Gradio UI ([app.py:23](app.py#L23)) reads `session["selected_item"]`, `session["price_check"]`, `session["outfit_suggestion"]`, `session["fit_card"]`, `session["search_adjustments"]`, and `session["profile_applied"]` to populate the output panels; the price verdict is folded into the listing panel; adjustments and profile notices are surfaced as info banners.
 
 ---
 
@@ -167,6 +222,10 @@ The implementation follows the planning.md spec closely. The four tools cover ex
 3. **`suggest_outfit` return type changed from `str` to `dict`.** The planning.md spec listed the return as a dict, but an earlier implementation draft had it return a plain string. The dict shape (with `outfit_description`, `matching_items`, `style_reasoning`, `style_category`) was formalized to give `create_fit_card` and the Gradio formatter structured fields to work with.
 
 4. **`create_fit_card` failure became partial success, not a hard stop.** The original error table said to display the outfit and note the failure. The implementation encodes this as `session["fit_card"] = None` and lets the Gradio formatter handle the display, which keeps the agent loop simple and the UI consistent.
+
+5. **`search_listings` gained an automatic retry wrapper.** Rather than surfacing an empty-result error immediately, `search_with_fallback` progressively relaxes constraints (size first, then price ceiling) and records each relaxation in `session["search_adjustments"]` so the UI can surface exactly what changed.
+
+6. **Cross-session style profile memory was added.** `run_agent` now accepts an optional `profile_id` / `save_profile` pair. On load, any saved `preferred_size` or `max_price` fills in query fields the user left blank. On save, the session's size, budget, item style tags, and wardrobe are persisted to `data/style_profiles.json` so returning users need not re-describe their preferences.
 
 ---
 
