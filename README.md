@@ -1,4 +1,4 @@
-# StyleFindr — FitFindr Agent
+# StyleFindr — Agentic Fashion Application
 
 A multi-tool AI agent that helps users find secondhand clothing listings, suggests outfits intelligently using the user's wardrobe, generates shareable fit captions for social media, and gauges whether a listing's price is fair against comparable items; all from a single natural-language processing query.
 
